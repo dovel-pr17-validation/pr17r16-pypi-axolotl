@@ -1,0 +1,273 @@
+"""CLI to merge a trained LoRA into a base model."""
+
+import shutil
+from pathlib import Path
+from typing import Union
+
+import fire
+import torch
+
+from axolotl.cli.config import load_cfg
+from axolotl.cli.utils import load_model_and_tokenizer
+from axolotl.cli.utils.lora_merge import merge_lora_sharded_efficient
+from axolotl.integrations.base import PluginManager
+from axolotl.model_support import get_model_support
+from axolotl.telemetry.errors import send_errors
+from axolotl.utils.dict import DictDefault
+from axolotl.utils.logging import get_logger
+
+LOG = get_logger(__name__)
+
+
+@send_errors
+def do_merge_lora(*, cfg: DictDefault) -> None:
+    """
+    Merges LoRA adapters with base model using either memory-efficient or legacy approach.
+
+    Args:
+        cfg: Dictionary mapping `axolotl` config keys to values.
+    """
+    if str(getattr(cfg, "adapter", None)) == "mixlora":
+        raise NotImplementedError(
+            "merge-lora is not supported for `adapter: mixlora` — MixLoRA experts "
+            "are not merged into the base model. Load the trained checkpoint "
+            "directly via `lora_model_dir` instead."
+        )
+
+    configured_merge_method = getattr(cfg, "merge_method", None)
+    merge_method = configured_merge_method or "memory_efficient"
+    support = get_model_support(getattr(cfg, "model_config_type", None))
+    resolve_merge_method = getattr(support, "resolve_lora_merge_method", None)
+    if resolve_merge_method is not None:
+        merge_method = resolve_merge_method(cfg, configured_merge_method)
+    if merge_method == "legacy":
+        if cfg.get("merge_compile"):
+            raise ValueError("merge_compile requires merge_method: memory_efficient")
+        if (
+            getattr(cfg, "_original_nf4_backend", None) or cfg.nf4_backend
+        ) == "torchao" or getattr(cfg, "_original_staged_nf4", False):
+            raise ValueError(
+                "Staged NF4 adapters require merge_method: memory_efficient to reconstruct the quantized base"
+            )
+        LOG.debug("Using legacy LoRA merging method...")
+        _do_merge_lora_legacy(cfg=cfg)
+    else:
+        LOG.debug("Using memory-efficient LoRA merging method...")
+        _do_merge_lora_efficient(cfg=cfg)
+
+
+def _do_merge_lora_legacy(*, cfg: DictDefault) -> None:
+    """
+    Legacy LoRA merging using merge_and_unload.
+    Loads the full model into memory before merging.
+    """
+    LOG.debug("Using legacy LoRA merging method...")
+    model, tokenizer, processor = load_model_and_tokenizer(cfg=cfg)
+
+    LOG.info("Running merge of LoRA with base model...")
+    model = model.merge_and_unload(progressbar=True)
+    try:
+        model.to(dtype=cfg.torch_dtype)
+    except ValueError as e:
+        LOG.warning("Failed to convert model to dtype %s", cfg.torch_dtype)
+        LOG.warning("Ignore this if the base_model is pre-quantized.")
+        LOG.warning("Error raised: %s", e)
+
+    model.generation_config.do_sample = True
+    model.config.use_cache = True
+
+    if cfg.local_rank == 0:
+        LOG.info(f"Saving merged model to: {str(Path(cfg.output_dir) / 'merged')}...")
+        model.save_pretrained(
+            str(Path(cfg.output_dir) / "merged"),
+            progressbar=True,
+        )
+        base_model = getattr(cfg, "base_model", None)
+        base_model_path = Path(base_model) if isinstance(base_model, str) else None
+        if (
+            getattr(cfg, "trust_remote_code", False)
+            and base_model_path is not None
+            and base_model_path.is_dir()
+        ):
+            _copy_remote_code_files(base_model_path, Path(cfg.output_dir) / "merged")
+        tokenizer.save_pretrained(
+            str(Path(cfg.output_dir) / "merged"),
+            save_jinja_files=cfg.tokenizer_save_jinja_files,
+        )
+
+        if processor:
+            processor.save_pretrained(str(Path(cfg.output_dir) / "merged"))
+        PluginManager.get_instance().post_lora_merge(
+            cfg,
+            str(cfg.lora_model_dir),
+            str(Path(cfg.output_dir) / "merged"),
+        )
+
+
+def _copy_remote_code_files(base_model_path: Path, output_path: Path) -> None:
+    base_model_path = base_model_path.resolve()
+    output_path = output_path.resolve()
+    for source in base_model_path.rglob("*.py"):
+        relative = source.relative_to(base_model_path)
+        if any(part in {".git", "__pycache__"} for part in relative.parts):
+            continue
+        target = output_path / relative
+        if source == target or output_path in source.parents:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
+def _do_merge_lora_efficient(*, cfg: DictDefault) -> None:
+    """
+    Memory-efficient LoRA merging using shard-by-shard processing.
+    Does not load the full model into memory.
+
+    Supports standard LoRA, RSLoRA, and DoRA. Unsupported methods (AdaLoRA, VeRA)
+    will raise NotImplementedError — use legacy method for those, unless training
+    used staged NF4, which the legacy path cannot reconstruct.
+    """
+    LOG.debug("Using memory-efficient LoRA merging method...")
+
+    output_path = Path(cfg.output_dir) / "merged"
+    safe_tensors = getattr(cfg, "save_safetensors", True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Detect NF4 quantization from config to simulate QLoRA training dynamics.
+    # Check both current and original (pre-override) config values since do_cli
+    # forces load_in_4bit=False for the legacy path.
+    simulate_nf4 = bool(
+        getattr(cfg, "load_in_4bit", False)
+        or getattr(cfg, "_original_load_in_4bit", False)
+        or getattr(cfg, "adapter", None) == "qlora"
+        or getattr(cfg, "_original_adapter", None) == "qlora"
+    )
+
+    from axolotl.utils.nf4 import bnb_4bit_skip_modules, nf4_skip_modules
+
+    bnb_config_kwargs = getattr(cfg, "bnb_config_kwargs", None) or {}
+    nf4_blocksize = bnb_config_kwargs.get("blocksize", None)
+    nf4_double_quant = bnb_config_kwargs.get("bnb_4bit_use_double_quant", True)
+    bnb_skip_modules = bnb_config_kwargs.get(
+        "llm_int8_skip_modules", bnb_4bit_skip_modules(cfg.model_config_type)
+    )
+
+    # Detect MoE expert quantization
+    simulate_nf4_experts = bool(
+        getattr(cfg, "quantize_moe_experts", False)
+        or getattr(cfg, "_original_quantize_moe_experts", False)
+    )
+
+    staged_nf4 = bool(getattr(cfg, "_original_staged_nf4", False))
+    nf4_backend = (
+        getattr(cfg, "_original_nf4_backend", None) or cfg.nf4_backend or "bitsandbytes"
+    )
+    # only staged/torchao training quantized by this exclusion policy
+    nf4_skips = (
+        nf4_skip_modules(cfg.model_config_type, bnb_config_kwargs)
+        if staged_nf4 or nf4_backend == "torchao"
+        else None
+    )
+
+    merge_lora_sharded_efficient(
+        base_model_path=cfg.base_model,
+        lora_adapter_path=cfg.lora_model_dir,
+        output_path=output_path,
+        safe_tensors=safe_tensors,
+        device=device,
+        simulate_nf4=simulate_nf4,
+        simulate_nf4_experts=simulate_nf4_experts,
+        nf4_blocksize=nf4_blocksize,
+        nf4_skips=nf4_skips,
+        nf4_dtype=cfg.torch_dtype if nf4_skips is not None else None,
+        nf4_double_quant=nf4_double_quant,
+        bnb_skip_modules=bnb_skip_modules,
+        staged_nf4=staged_nf4,
+        nf4_backend=nf4_backend,
+        trust_remote_code=bool(getattr(cfg, "trust_remote_code", False)),
+        dequant=bool(getattr(cfg, "merge_dequant", False)),
+        override_quantizer=bool(getattr(cfg, "merge_override_quantizer", False)),
+        revision=cfg.revision_of_model,
+        merge_compile=bool(cfg.get("merge_compile", False)),
+        merge_compile_precision=cfg.get("merge_compile_precision") or "strict",
+    )
+    PluginManager.get_instance().post_lora_merge(
+        cfg,
+        str(cfg.lora_model_dir),
+        str(output_path),
+    )
+
+    LOG.debug("Memory-efficient LoRA merge completed successfully!")
+
+
+def do_cli(
+    config: Union[Path, str] = Path("examples/"),
+    dequant: bool = False,
+    override_quantizer: bool = False,
+    **kwargs,
+) -> None:
+    """
+    Parses `axolotl` config, CLI args, and calls `do_merge_lora`. Note that various
+    config values will be overwritten to allow the LoRA merge logic to work as expected
+    (`load_in_8bit=False`, `load_in4bit=False`, `flash_attention=False`, etc.).
+
+    Args:
+        config: Path to `axolotl` config YAML file.
+        dequant: If set (``--dequant``), dequantize a quantized base to bf16 in the merged
+            checkpoint. Default keeps the base's quantized dtypes (fp8/nvfp4) intact.
+        override_quantizer: If set (``--override-quantizer``), merge a merge-aware adapter
+            despite a quantizer-identity mismatch (e.g. different torchao version than the
+            one trained with) instead of hard-erroring.
+        kwargs: Additional keyword arguments to override config file values.
+
+    Raises:
+        ValueError: If target directory for LoRA merged model does not exist.
+    """
+
+    # Pre-load config to detect original quantization settings before overrides
+    raw_cfg = load_cfg(config, **kwargs)
+    original_load_in_4bit = getattr(raw_cfg, "load_in_4bit", False)
+    original_adapter = getattr(raw_cfg, "adapter", None)
+    original_quantize_moe_experts = getattr(raw_cfg, "quantize_moe_experts", False)
+    original_nf4_backend = raw_cfg.nf4_backend or "bitsandbytes"
+    from axolotl.loaders.nf4 import uses_staged_nf4
+
+    original_staged_nf4 = uses_staged_nf4(raw_cfg)
+
+    merge_overrides = {
+        "merge_lora": True,
+        "load_in_8bit": False,
+        "load_in_4bit": False,
+        "quantize_moe_experts": False,
+        "nf4_backend": "bitsandbytes",
+        "qlora_sharded_model_loading": False,
+        "ple_cpu_offload": False,
+        "attn_implementation": None,
+        "context_parallel_size": None,
+        "deepspeed": None,
+        "fsdp": None,
+        "fsdp_config": None,
+    }
+    parsed_cfg = load_cfg(config, **{**kwargs, **merge_overrides})
+
+    # Stash original quantization settings for NF4 simulation in efficient merge
+    parsed_cfg._original_load_in_4bit = original_load_in_4bit
+    parsed_cfg._original_adapter = original_adapter
+    parsed_cfg._original_quantize_moe_experts = original_quantize_moe_experts
+    parsed_cfg._original_nf4_backend = original_nf4_backend
+    parsed_cfg._original_staged_nf4 = original_staged_nf4
+    parsed_cfg.merge_dequant = bool(dequant)
+    parsed_cfg.merge_override_quantizer = bool(override_quantizer)
+
+    if not parsed_cfg.lora_model_dir and parsed_cfg.output_dir:
+        parsed_cfg.lora_model_dir = parsed_cfg.output_dir
+    if not Path(parsed_cfg.lora_model_dir).exists():
+        raise ValueError(
+            f"Target directory for LoRA adapter weights does not exist: `{parsed_cfg.lora_model_dir}`"
+        )
+
+    do_merge_lora(cfg=parsed_cfg)
+
+
+if __name__ == "__main__":
+    fire.Fire(do_cli)

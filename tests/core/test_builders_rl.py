@@ -1,0 +1,415 @@
+"""Unit tests for axolotl.core.builders RL (preference/GRPO) trainer builders."""
+
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from datasets import Dataset
+from transformers import CLIPImageProcessor, LlavaProcessor
+
+from axolotl.core.builders import HFRLTrainerBuilder
+from axolotl.utils.data import prepare_preference_datasets
+from axolotl.utils.dict import DictDefault
+
+from tests.constants import ALPACA_MESSAGES_CONFIG_REVISION, alpaca_messages_dpo_rows
+
+
+@pytest.fixture(name="processor")
+def fixture_processor(tokenizer):
+    return LlavaProcessor(image_processor=CLIPImageProcessor(), tokenizer=tokenizer)
+
+
+def _preference_dataset(cfg_string: str) -> Dataset:
+    if cfg_string in {"dpo_cfg", "ipo_cfg", "grpo_cfg", "simpo_cfg"}:
+        return Dataset.from_list(alpaca_messages_dpo_rows())
+    if cfg_string == "orpo_cfg":
+        return Dataset.from_list(
+            [
+                {
+                    "chosen": [
+                        {"role": "user", "content": f"Question {idx}?"},
+                        {"role": "assistant", "content": f"Chosen answer {idx}."},
+                    ],
+                    "rejected": [
+                        {"role": "user", "content": f"Question {idx}?"},
+                        {"role": "assistant", "content": f"Rejected answer {idx}."},
+                    ],
+                }
+                for idx in range(16)
+            ]
+        )
+    if cfg_string == "kto_cfg":
+        return Dataset.from_list(
+            [
+                {
+                    "prompt": f"Question {idx}?",
+                    "completion": f"Answer {idx}.",
+                    "label": idx % 2 == 0,
+                }
+                for idx in range(16)
+            ]
+        )
+    raise ValueError(f"Unhandled cfg_string: {cfg_string}")
+
+
+class TestHFRLTrainerBuilder:
+    """
+    TestCase class for RLHF trainer builders
+    """
+
+    def _test_common_training_arguments(self, training_arguments, rl: str):
+        """Helper to test common arguments across all variants"""
+        # Basic training settings
+        if rl == "grpo":
+            # grpo_cfg's micro_batch_size is diff from others
+            assert training_arguments.per_device_train_batch_size == 4
+        else:
+            assert training_arguments.per_device_train_batch_size == 2
+        assert training_arguments.gradient_accumulation_steps == 1
+        assert training_arguments.max_steps == 100
+
+        # Optimizer settings
+        assert training_arguments.learning_rate == 0.00005
+        assert training_arguments.weight_decay == 0.01
+        assert training_arguments.adam_beta1 == 0.91
+        assert training_arguments.adam_beta2 == 0.99
+        assert training_arguments.adam_epsilon == 0.00001
+        assert training_arguments.max_grad_norm == 1.0
+
+        # LR scheduler settings
+        assert training_arguments.lr_scheduler_type == "cosine"
+        assert training_arguments.warmup_steps == 10
+        assert training_arguments.cosine_min_lr_ratio == 0.1
+        assert training_arguments.cosine_constant_lr_ratio == 0.2
+
+        # Other settings
+        assert training_arguments.dataloader_num_workers == 1
+        assert training_arguments.dataloader_pin_memory is True
+
+        assert training_arguments.gradient_checkpointing is False
+
+    def test_dpo_training_arguments(self, dpo_cfg, model, tokenizer):
+        dpo_cfg["precompute_ref_log_probs"] = True
+        builder = HFRLTrainerBuilder(dpo_cfg, model, tokenizer)
+        training_arguments, _ = builder._build_training_arguments(100)
+
+        self._test_common_training_arguments(training_arguments, rl=dpo_cfg.rl)
+        # DPO specific
+        assert training_arguments.beta == 0.1
+        assert hasattr(training_arguments, "use_weighting")
+        assert training_arguments.use_weighting is True
+        assert training_arguments.label_smoothing == 0.1
+        assert training_arguments.precompute_ref_log_probs is True
+        assert training_arguments.loss_type == ["sigmoid", "sft"]
+        assert training_arguments.loss_weights == [1.0, 0.5]
+
+    def test_dpo_ld_alpha_and_liger_reach_trl_config(self, dpo_cfg, model, tokenizer):
+        """ld_alpha rides the same strategy hook as the loss list into TRL's DPOConfig, and
+        liger leaves the loss list intact."""
+        dpo_cfg["dpo_loss_type"] = ["apo_zero", "hinge"]
+        dpo_cfg["dpo_loss_weights"] = [1.0, 0.5]
+        dpo_cfg["dpo_ld_alpha"] = 0.3
+        dpo_cfg["dpo_use_liger_kernel"] = True
+        dpo_cfg["dpo_use_weighting"] = (
+            False  # TRL rejects weighting together with liger
+        )
+        builder = HFRLTrainerBuilder(dpo_cfg, model, tokenizer)
+        training_arguments, _ = builder._build_training_arguments(100)
+
+        assert training_arguments.ld_alpha == 0.3
+        assert training_arguments.use_liger_kernel is True
+        assert training_arguments.loss_type == ["apo_zero", "hinge"]
+        assert training_arguments.loss_weights == [1.0, 0.5]
+
+    def test_orpo_training_arguments(self, orpo_cfg, model, tokenizer):
+        builder = HFRLTrainerBuilder(orpo_cfg, model, tokenizer)
+        training_arguments, _ = builder._build_training_arguments(100)
+
+        self._test_common_training_arguments(training_arguments, rl=orpo_cfg.rl)
+        # ORPO specific
+        assert training_arguments.beta == 0.1  # maps from orpo_alpha
+
+    def test_kto_training_arguments(self, kto_cfg, model, tokenizer):
+        builder = HFRLTrainerBuilder(kto_cfg, model, tokenizer)
+        training_arguments, _ = builder._build_training_arguments(100)
+
+        self._test_common_training_arguments(training_arguments, rl=kto_cfg.rl)
+        # KTO specific
+        assert training_arguments.desirable_weight == 1.0
+        assert training_arguments.undesirable_weight == 1.0
+
+    def _write_rewards_file(self, rewards_dir: Path):
+        """
+        Writes reward function to local tmp path to be loaded on trainer building
+        """
+        # Create rewards.py in a directory we can import from
+        rewards_dir.mkdir()
+        rewards_file = rewards_dir / "rewards.py"
+        rewards_file.write_text(
+            """import random
+def rand_reward_func(prompts, completions) -> list[float]:
+    return [random.uniform(0, 1) for _ in completions]
+"""
+        )
+
+    def test_grpo_training_arguments(self, grpo_cfg, model, tokenizer, tmp_path):
+        rewards_dir = tmp_path / "rewards_test"
+        self._write_rewards_file(rewards_dir)
+
+        # Add the directory to Python path so we can import the module
+        sys.path.insert(0, str(rewards_dir))
+
+        try:
+            builder = HFRLTrainerBuilder(grpo_cfg, model, tokenizer)
+            training_arguments, _ = builder._build_training_arguments(100)
+            builder.train_dataset = Dataset.from_dict(
+                {"prompt": [[{"role": "user", "content": "Question?"}]] * 8}
+            )
+
+            self._test_common_training_arguments(training_arguments, rl=grpo_cfg.rl)
+            # GRPO specific
+            assert training_arguments.beta == 0.001
+            assert training_arguments.max_completion_length == 256
+            assert training_arguments.use_vllm is False
+            # assert training_arguments.vllm_device == "auto"
+            # assert training_arguments.vllm_gpu_memory_utilization == 0.15
+            assert training_arguments.num_generations == 4
+
+            # Test trainer creation to verify reward_funcs
+            trainer = builder.build(100)
+
+            # Verify reward functions are properly loaded
+            assert len(trainer.reward_funcs) == 1
+            assert trainer.reward_funcs[0].__module__ == "rewards"
+            assert trainer.reward_funcs[0].__name__ == "rand_reward_func"
+        finally:
+            # remove imported module from path
+            if str(rewards_dir) in sys.path:
+                sys.path.remove(str(rewards_dir))
+
+    def test_dpo_vision_dataset_uses_processor(
+        self, dpo_cfg, model, tokenizer, processor
+    ):
+        from axolotl.utils.collators.mm_rl import AxolotlVisionPreferenceCollator
+
+        builder = HFRLTrainerBuilder(dpo_cfg, model, tokenizer, processor=processor)
+        builder.train_dataset = Dataset.from_list(
+            [
+                {
+                    "prompt": [{"role": "user", "content": "Question?"}],
+                    "chosen": [{"role": "assistant", "content": "Yes."}],
+                    "rejected": [{"role": "assistant", "content": "No."}],
+                    "images": [],
+                }
+            ]
+            * 4
+        )
+
+        trainer = builder.build(100)
+
+        assert trainer.processing_class is processor
+        assert processor.chat_template == tokenizer.chat_template
+        assert isinstance(trainer.data_collator, AxolotlVisionPreferenceCollator)
+
+    def test_grpo_vision_dataset_uses_processor(
+        self, grpo_cfg, model, tokenizer, processor, tmp_path
+    ):
+        from axolotl.utils.collators.mm_rl import MultimodalRLExampleNormalizer
+
+        model.config.image_token_id = 0
+
+        rewards_dir = tmp_path / "rewards_test"
+        self._write_rewards_file(rewards_dir)
+        sys.path.insert(0, str(rewards_dir))
+        try:
+            builder = HFRLTrainerBuilder(
+                grpo_cfg, model, tokenizer, processor=processor
+            )
+            builder.train_dataset = Dataset.from_dict(
+                {
+                    "prompt": [[{"role": "user", "content": "Question?"}]] * 8,
+                    "images": [[]] * 8,
+                }
+            )
+
+            trainer = builder.build(100)
+
+            assert trainer.processing_class is processor
+            assert processor.tokenizer.padding_side == "left"
+            assert isinstance(trainer.data_collator, MultimodalRLExampleNormalizer)
+        finally:
+            if str(rewards_dir) in sys.path:
+                sys.path.remove(str(rewards_dir))
+
+    def test_vision_dataset_unsupported_rl_raises(
+        self, orpo_cfg, model, tokenizer, processor
+    ):
+        builder = HFRLTrainerBuilder(orpo_cfg, model, tokenizer, processor=processor)
+        builder.train_dataset = Dataset.from_list(
+            [{"prompt": "Q?", "chosen": "Yes.", "rejected": "No.", "images": []}]
+        )
+
+        with pytest.raises(ValueError, match="not supported for rl: orpo"):
+            builder.build(100)
+
+    @pytest.mark.parametrize(
+        ("cfg_name", "prompt"), [("dpo_cfg", "Q?"), ("grpo_cfg", "<image>Q?")]
+    )
+    def test_vision_string_prompt_raises(
+        self, request, cfg_name, prompt, model, tokenizer, processor
+    ):
+        cfg = request.getfixturevalue(cfg_name)
+        builder = HFRLTrainerBuilder(cfg, model, tokenizer, processor=processor)
+        builder.train_dataset = Dataset.from_list(
+            [
+                {
+                    "prompt": prompt,
+                    "chosen": "Yes.",
+                    "rejected": "No.",
+                    "images": ["a.png"],
+                }
+            ]
+        )
+
+        with pytest.raises(ValueError, match="needs conversational prompts"):
+            builder._validate_vision_rl()
+
+    def test_ipo_training_arguments(self, ipo_cfg, model, tokenizer):
+        builder = HFRLTrainerBuilder(ipo_cfg, model, tokenizer)
+        training_arguments, _ = builder._build_training_arguments(100)
+
+        self._test_common_training_arguments(training_arguments, rl=ipo_cfg.rl)
+        # IPO specific
+        assert training_arguments.beta == 0.1
+        assert training_arguments.loss_type == ["ipo"]
+        assert training_arguments.label_smoothing == 0
+
+    def test_simpo_training_arguments(self, simpo_cfg, model, tokenizer):
+        builder = HFRLTrainerBuilder(simpo_cfg, model, tokenizer)
+        training_arguments, _ = builder._build_training_arguments(100)
+
+        self._test_common_training_arguments(training_arguments, rl=simpo_cfg.rl)
+        # SIMPO specific
+        assert training_arguments.beta == 0.2
+        assert training_arguments.cpo_alpha == 0.9
+        assert training_arguments.simpo_gamma == 0.4
+
+    @pytest.mark.parametrize(
+        "cfg_string",
+        [
+            "dpo_cfg",
+            "ipo_cfg",
+            "grpo_cfg",
+            "orpo_cfg",
+            "kto_cfg",
+        ],
+    )
+    def test_custom_optimizer_cls_and_kwargs(
+        self,
+        request,
+        cfg_string,
+        tmp_path,
+        model,
+        tokenizer,
+    ):
+        cfg = request.getfixturevalue(cfg_string)
+
+        builder = HFRLTrainerBuilder(cfg, model, tokenizer)
+        cfg["optimizer"] = "muon"
+
+        if cfg_string in ["dpo_cfg", "ipo_cfg", "grpo_cfg", "simpo_cfg"]:
+            cfg["datasets"] = [DictDefault(ALPACA_MESSAGES_CONFIG_REVISION)]
+        elif cfg_string == "kto_cfg":
+            cfg["datasets"] = [
+                DictDefault(
+                    {
+                        "path": "argilla/ultrafeedback-binarized-preferences-cleaned-kto",
+                        "type": "llama3.ultra",
+                        "split": "train[:32]",
+                    }
+                )
+            ]
+        elif cfg_string == "orpo_cfg":
+            cfg["datasets"] = [
+                DictDefault(
+                    {
+                        "path": "argilla/ultrafeedback-binarized-preferences-cleaned",
+                        "type": "chat_template.argilla",
+                        "split": "train[:32]",
+                    }
+                )
+            ]
+        else:
+            raise ValueError(f"Unhandled cfg_string: {cfg_string}")
+        cfg["dataset_num_proc"] = None
+
+        if cfg_string == "grpo_cfg":
+            rewards_dir = tmp_path / "rewards_test"
+            self._write_rewards_file(rewards_dir)
+
+            # Add the directory to Python path so we can import the module
+            sys.path.insert(0, str(rewards_dir))
+
+        try:
+            with (
+                patch(
+                    "axolotl.utils.data.rl.load_dataset_with_config"
+                ) as mock_load_dataset,
+                patch("axolotl.utils.data.rl.load_tokenizer", return_value=tokenizer),
+            ):
+                mock_load_dataset.return_value = _preference_dataset(cfg_string)
+                train_dataset, eval_dataset = prepare_preference_datasets(
+                    cfg, tokenizer
+                )
+
+            builder.train_dataset = train_dataset
+            builder.eval_dataset = eval_dataset
+
+            trainer = builder.build(100)
+
+            assert trainer.optimizer_cls_and_kwargs is not None
+
+            from axolotl.contribs.mit.muon import MuonOptimizerFactory
+            from axolotl.contribs.mit.muon.muon import Muon
+
+            optimizer_cls, optimizer_kwargs = trainer.optimizer_cls_and_kwargs
+            assert optimizer_cls is MuonOptimizerFactory
+            assert optimizer_kwargs["lr"] == 0.00005
+            assert optimizer_kwargs["weight_decay"] == 0.01
+            assert optimizer_kwargs["betas"] == (0.91, 0.99)
+            assert optimizer_kwargs["eps"] == 0.00001
+
+            # Ensure optimizer is created with correct class
+            optim = trainer.create_optimizer()
+            assert isinstance(optim, Muon)
+
+        finally:
+            # remove imported module from path
+            if cfg_string == "grpo_cfg" and str(rewards_dir) in sys.path:
+                sys.path.remove(str(rewards_dir))
+
+
+def test_dpo_builder_attaches_fused_lora_kernels_after_trl_wraps(
+    dpo_cfg, model, tokenizer
+):
+    """DPO hands TRL the LoRA config, so the kernels are patched onto trainer.model."""
+    from types import SimpleNamespace
+
+    from peft import LoraConfig, get_peft_model
+
+    cfg = dpo_cfg.copy()
+    cfg.update(
+        {"adapter": "lora", "lora_r": 4, "lora_alpha": 8, "lora_qkv_kernel": True}
+    )
+    builder = HFRLTrainerBuilder(cfg, model, tokenizer)
+    peft_model = get_peft_model(
+        model, LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"])
+    )
+    with patch("axolotl.monkeypatch.lora_kernels.apply_lora_kernel_patches") as patched:
+        builder.hook_post_create_trainer(SimpleNamespace(model=peft_model))
+        patched.assert_called_once()
+        assert patched.call_args.kwargs["model"] is peft_model
+    with patch("axolotl.monkeypatch.lora_kernels.apply_lora_kernel_patches") as patched:
+        builder.hook_post_create_trainer(SimpleNamespace(model=model))
+        patched.assert_not_called()

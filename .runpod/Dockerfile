@@ -1,0 +1,16 @@
+FROM axolotlai/axolotl-cloud:main-py3.12-cu130-2.11.0
+
+COPY .runpod/requirements.txt /requirements.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --upgrade -r /requirements.txt
+
+# Environment settings
+ARG BASE_VOLUME="/runpod-volume"
+ENV BASE_VOLUME=$BASE_VOLUME
+ENV HF_DATASETS_CACHE="${BASE_VOLUME}/huggingface-cache/datasets"
+ENV HF_HUB_CACHE="${BASE_VOLUME}/huggingface-cache/hub"
+
+COPY .runpod/src /src
+
+WORKDIR /src
+CMD ["python3", "/src/handler.py"]

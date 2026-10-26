@@ -1,0 +1,70 @@
+"""
+launch axolotl in supported cloud platforms
+"""
+
+from pathlib import Path
+from typing import Literal
+
+import yaml
+
+from axolotl.cli.cloud.registry import load_cloud_provider
+from axolotl.utils.dict import DictDefault
+
+
+def load_cloud_cfg(cloud_config: Path | str) -> DictDefault:
+    """Load and validate cloud configuration."""
+    # Load cloud configuration.
+    with open(cloud_config, encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+    if not isinstance(config, dict):
+        raise ValueError("Cloud configuration must be a YAML mapping")
+    return DictDefault(config)
+
+
+def do_cli_preprocess(
+    cloud_config: Path | str,
+    config: Path | str,
+) -> None:
+    cloud_cfg = load_cloud_cfg(cloud_config)
+    cloud = load_cloud_provider(
+        cloud_cfg.to_dict(), config_dir=Path(cloud_config).resolve().parent
+    )
+    with open(config, "r", encoding="utf-8") as file:
+        config_yaml = file.read()
+    cloud.preprocess(config_yaml)
+
+
+def do_cli_train(
+    cloud_config: Path | str,
+    config: Path | str,
+    launcher: Literal["accelerate", "torchrun", "python"] = "accelerate",
+    launcher_args: list[str] | None = None,
+    cwd=None,
+    **kwargs,
+) -> None:
+    cloud_cfg: DictDefault = load_cloud_cfg(cloud_config)
+    cloud = load_cloud_provider(
+        cloud_cfg.to_dict(), config_dir=Path(cloud_config).resolve().parent
+    )
+    with open(config, "r", encoding="utf-8") as file:
+        config_yaml = file.read()
+    cloud.train(
+        config_yaml,
+        launcher=launcher,
+        launcher_args=launcher_args,
+        local_dirs=cloud.get_local_dirs(cwd),
+        **kwargs,
+    )
+
+
+def do_cli_lm_eval(
+    cloud_config: Path | str,
+    config: Path | str,
+) -> None:
+    cloud_cfg = load_cloud_cfg(cloud_config)
+    cloud = load_cloud_provider(
+        cloud_cfg.to_dict(), config_dir=Path(cloud_config).resolve().parent
+    )
+    with open(config, "r", encoding="utf-8") as file:
+        config_yaml = file.read()
+    cloud.lm_eval(config_yaml)

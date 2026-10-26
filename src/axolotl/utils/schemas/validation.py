@@ -1,0 +1,2684 @@
+"""Module with validation methods for config pydantic model."""
+
+import fnmatch
+import json
+import os
+import tempfile
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from pydantic import (
+    field_validator,
+    model_validator,
+)
+from transformers.utils.import_utils import is_torch_npu_available
+
+from axolotl.utils.dict import DictDefault
+from axolotl.utils.logging import get_logger
+from axolotl.utils.schemas.enums import (
+    ChatTemplate,
+    RLType,
+)
+from axolotl.utils.schemas.fp8 import DEFAULT_FP8_RECIPE, resolve_fp8_recipe
+from axolotl.utils.schemas.peft import VALUE_INDEPENDENT_LORA_INIT
+
+LOG = get_logger(__name__)
+
+# modules whose forward a fused kernel replaces, so module-scope SAC hooks on
+# them never fire; containers are listed because their hooks still fire but the
+# kernel's visible mm inside is then mutated in place
+_SAC_FUSED_MODULE_COVERAGE = (
+    (
+        "lora_mlp_kernel",
+        (
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "mlp",
+            "mixer",
+            "shared_experts",
+            "shared_expert",
+            "feedforward",
+            "experts",
+            "gate_projs",
+            "up_projs",
+            "down_projs",
+        ),
+    ),
+    (
+        "lora_qkv_kernel",
+        (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+            "self_attn",
+            "linear_attn",
+            "mixer",
+        ),
+    ),
+    ("lora_o_kernel", ("o_proj", "out_proj", "self_attn", "linear_attn", "mixer")),
+    ("flash_attn_fuse_mlp", ("gate_proj", "up_proj", "down_proj", "mlp")),
+)
+
+# decoder-layer and model containers enclose every projection a LoRA kernel runs;
+# a numeric last component (``layers.0``) names a decoder layer
+_SAC_LAYER_CONTAINERS = (
+    "model",
+    "language_model",
+    "text_model",
+    "decoder",
+    "transformer",
+    "backbone",
+    "layers",
+    "layer",
+    "h",
+    "blocks",
+    "block",
+)
+
+_LORA_KERNEL_FLAGS = (
+    "lora_mlp_kernel",
+    "lora_qkv_kernel",
+    "lora_o_kernel",
+    "lora_embedding_kernel",
+)
+
+
+def lora_kernels_auto_enable(get: Callable[[str], Any]) -> bool:
+    """Whether the unset ``lora_*_kernel`` flags would be auto-enabled for this config.
+
+    ``get`` reads a config value by name (a raw ``data`` dict or a validated model).
+    The single source of truth for ``check_auto_enable_lora_kernels`` and for the
+    validators that must predict its outcome.
+    """
+    if get("rl") or get("nvfp4_merge_aware"):
+        return False
+    adapter = get("adapter")
+    if adapter not in ("lora", "qlora"):
+        return False
+    if any(get(flag) is not None for flag in _LORA_KERNEL_FLAGS):
+        return False
+    if adapter == "lora" and get("load_in_8bit"):
+        return False
+    if get("trust_remote_code"):
+        return False
+
+    from axolotl.model_support import (
+        Unsupported,
+        get_model_support,
+        resolve_model_support,
+    )
+
+    support = get_model_support(get("model_config_type"))
+    if support is not None and isinstance(
+        resolve_model_support(support).capabilities.get("lora_kernels"), Unsupported
+    ):
+        return False
+
+    return True
+
+
+def _lora_kernel_enabled(cfg, flag: str) -> bool:
+    """Explicit flag value, else whether check_auto_enable_lora_kernels would set it.
+
+    Auto-enable runs only on the capabilities-aware config class, so an unset flag
+    is predicted from the same preconditions rather than read as off.
+    """
+    value = getattr(cfg, flag, None)
+    if value is not None:
+        return bool(value) and bool(cfg.adapter)
+    return lora_kernels_auto_enable(lambda key: getattr(cfg, key, None))
+
+
+def _sac_entry_covers(entry: str, module: str) -> bool:
+    last = entry.rsplit(".", 1)[-1]
+    if any(ch in last for ch in "*?["):
+        return fnmatch.fnmatchcase(module, last)
+    return last == module
+
+
+def _sac_entry_is_layer_container(entry: str) -> bool:
+    last = entry.rsplit(".", 1)[-1]
+    if any(ch in last for ch in "*?["):
+        candidates = _SAC_LAYER_CONTAINERS + tuple(str(i) for i in range(100))
+        return any(fnmatch.fnmatchcase(name, last) for name in candidates)
+    return last.isdigit() or last in _SAC_LAYER_CONTAINERS
+
+
+def _flash_attn_kernel_failure(attn_implementation: str) -> str | None:
+    """The error transformers swallows when its kernels-hub fallback fails."""
+    try:
+        from kernels import get_kernel
+        from transformers.integrations.hub_kernels import get_attn_kernel_version
+        from transformers.modeling_flash_attention_utils import (
+            FLASH_ATTN_KERNEL_FALLBACK,
+        )
+    except ImportError as err:
+        return f"{type(err).__name__}: {err}"
+    repo_id = FLASH_ATTN_KERNEL_FALLBACK.get(attn_implementation)
+    if repo_id is None:
+        return None
+    version: int | None = None
+    try:
+        # resolving the pinned version lists hub refs, so it fails offline too
+        version = get_attn_kernel_version(repo_id)
+        # Direct kernels calls do not read Transformers' allow_all_hub_kernels flag.
+        get_kernel(repo_id, version=version, trust_remote_code=True)
+    except Exception as err:  # noqa: BLE001
+        try:
+            _get_kernel_from_cache(repo_id, version)
+        except Exception:  # noqa: BLE001
+            return f"{type(err).__name__}: {err}"
+        LOG.warning(
+            "kernels hub lookup for %s failed (%s: %s); using the cached build",
+            repo_id,
+            type(err).__name__,
+            err,
+        )
+    return None
+
+
+def _get_kernel_from_cache(repo_id: str, version: int | None):
+    """Load a hub kernel from a cached snapshot without touching the network."""
+    from huggingface_hub import constants
+    from huggingface_hub.file_download import repo_folder_name
+    from kernels import get_local_kernel
+
+    cache_dir = Path(os.environ.get("KERNELS_CACHE") or constants.HF_HUB_CACHE)
+    # get_kernel(version=N) downloads by commit and writes no refs entry, so the
+    # kernels offline resolver cannot map the version; read the snapshots directly
+    candidates: list[Path] = []
+    for repo_type in ("kernel", "model"):
+        repo_dir = cache_dir / repo_folder_name(repo_id=repo_id, repo_type=repo_type)
+        ref = repo_dir / "refs" / f"v{version}"
+        if version is not None and ref.is_file():
+            pinned = repo_dir / "snapshots" / ref.read_text().strip()
+            if pinned.is_dir():
+                candidates.append(pinned)
+        snapshots = repo_dir / "snapshots"
+        if snapshots.is_dir():
+            candidates.extend(
+                sorted(
+                    (p for p in snapshots.iterdir() if (p / "build").is_dir()),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+            )
+    errors = []
+    for snapshot in dict.fromkeys(candidates):
+        try:
+            return get_local_kernel(snapshot, trust_remote_code=True)
+        except Exception as err:  # noqa: BLE001
+            errors.append(f"{snapshot.name}: {type(err).__name__}: {err}")
+    detail = f": {'; '.join(errors)}" if errors else ""
+    raise FileNotFoundError(f"no loadable cached snapshot of {repo_id}{detail}")
+
+
+SUPPORTED_METRICS = {"sacrebleu", "comet", "ter", "chrf", "perplexity"}
+
+FSDP1_MIGRATION_DOCS = "docs/multi-gpu.qmd#sec-migrate-fsdp1-fsdp2"
+
+# fsdp_config keys accelerate rejects under FSDP2; the value names the FSDP2 replacement
+FSDP1_ONLY_REJECTED_KEYS = {
+    "sharding_strategy": "reshard_after_forward",
+    "forward_prefetch": None,
+}
+
+# fsdp_config keys accelerate silently discards under FSDP2
+FSDP1_ONLY_IGNORED_KEYS = (
+    "sync_module_states",
+    "backward_prefetch",
+    "backward_prefetch_policy",
+    "limit_all_gathers",
+    "use_orig_params",
+)
+
+
+class DatasetValidationMixin:
+    """Validation methods related to dataset configuration."""
+
+    @field_validator("seed", mode="after")
+    @classmethod
+    def set_default_seed(cls, seed):
+        if seed is None:
+            LOG.info("`seed` not set in config; setting to 42")
+            seed = 42
+        return seed
+
+    @model_validator(mode="after")
+    def seed_full_determinism(self):
+        if self.full_determinism and self.seed is None:
+            LOG.info("`full_determinism` set without `seed`; setting seed to 42")
+            self.seed = 42
+        return self
+
+    @field_validator("datasets", mode="before")
+    @classmethod
+    def deprecate_sharegpt_datasets(cls, datasets):
+        for _, ds_cfg in enumerate(datasets):
+            ds_type = (
+                ds_cfg.get("type")
+                if isinstance(ds_cfg, dict)
+                else getattr(ds_cfg, "type", None)
+            )
+            if not ds_type:
+                continue
+
+            if isinstance(ds_type, dict):
+                continue
+
+            if isinstance(ds_type, str) and ds_type.startswith("sharegpt"):
+                raise ValueError(
+                    "`type: sharegpt.*` is deprecated. Please use `type: chat_template` instead."
+                )
+
+        return datasets
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_deprecated_unsloth_fields(cls, data):
+        deprecated_fields = [
+            "unsloth_cross_entropy_loss",
+            "unsloth_lora_mlp",
+            "unsloth_lora_qkv",
+            "unsloth_lora_o",
+            "unsloth_rms_norm",
+            "unsloth_rope",
+        ]
+        found = [f for f in deprecated_fields if data.get(f)]
+        if found:
+            raise ValueError(
+                f"`{'`, `'.join(found)}` {'has' if len(found) == 1 else 'have'} been removed. "
+                "Please use `lora_mlp_kernel`, `lora_qkv_kernel`, `lora_o_kernel` instead. "
+                "See: https://docs.axolotl.ai/docs/lora_optims.html"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_dataset_or_pretraining_dataset(cls, data):
+        if data.get("datasets") is None and data.get("pretraining_dataset") is None:
+            raise ValueError("either datasets or pretraining_dataset is required")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_pretraining_streaming_deprecation(cls, data):
+        # TODO(djsaunde): remove this check + implement change for 0.13.0 release
+        if data.get("pretraining_dataset") and not data.get("streaming"):
+            LOG.warning(
+                "Setting `pretraining_dataset` without explicitly setting `streaming: "
+                "true` is deprecated. In a future release, streaming will not be "
+                "automatically enabled when using pretraining_dataset. Please "
+                "explicitly set `streaming: true` in your configuration to maintain "
+                "current behavior."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_push_ds_auth(cls, data):
+        if (
+            data.get("push_dataset_to_hub")
+            and data.get("hf_use_auth_token") is not True
+        ):
+            raise ValueError(
+                "Require cfg.hf_use_auth_token to be True for push_dataset_to_hub"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_val_w_test_datasets(cls, data):
+        if data.get("test_datasets") and data.get("val_set_size"):
+            raise ValueError(
+                "non-zero val_set_size should not be used with test_datasets configuration"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_test_datasets_bench(cls, data):
+        if (
+            data.get("do_bench_eval")
+            and not data.get("test_datasets")
+            and not data.get("val_set_size")
+        ):
+            LOG.warning(
+                "`do_bench_eval` needs a test dataset to run evals, adding an empty test_dataset."
+            )
+            data["test_datasets"] = [{"path": "axolotl-ai-co/empty-test-ds"}]
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_eval_packing(cls, data):
+        # TODO also should check test_datasets and val_set_size as we can skip
+        # if there are no eval datasets/splits
+        if (
+            data.get("sample_packing")
+            and data.get("eval_table_size")
+            and data.get("eval_sample_packing") is not False
+        ):
+            raise ValueError(
+                "eval_table_size and eval_sample_packing are not supported together with sample_packing. Please set 'eval_sample_packing' to false."
+            )
+        if (
+            data.get("sample_packing")
+            and data.get("eval_sample_packing") is None
+            and not data.get("eval_table_size")
+        ):
+            LOG.info(
+                "explicitly setting `eval_sample_packing` to match `sample_packing`",
+            )
+            data["eval_sample_packing"] = True
+
+        if (
+            data.get("sample_packing")
+            and data.get("eval_sample_packing") is False
+            and data.get("remove_unused_columns") is None
+        ):
+            LOG.info(
+                "setting `remove_unused_columns: false` for when sample_packing and eval_sample_packing don't match"
+            )
+            data["remove_unused_columns"] = False
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_mm_prepare(cls, data):
+        if data.get("skip_prepare_dataset"):
+            if data.get("remove_unused_columns") is None:
+                LOG.info(
+                    "setting `remove_unused_columns: false` for skip_prepare_dataset"
+                )
+                data["remove_unused_columns"] = False
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_generation_tags_needs_prepare(cls, data):
+        if data.get("skip_prepare_dataset") and any(
+            ds.get("generation_tags")
+            if isinstance(ds, dict)
+            else getattr(ds, "generation_tags", None)
+            for ds in (data.get("datasets") or []) + (data.get("test_datasets") or [])
+        ):
+            raise ValueError(
+                "generation_tags labels during dataset preparation and has no effect "
+                "with skip_prepare_dataset"
+            )
+        return data
+
+
+class AttentionValidationMixin:
+    """Validation methods related to attention mechanisms."""
+
+    @model_validator(mode="after")
+    def check_sample_packing_without_attention(self):
+        native_diffusion_default = (
+            self.diffusion_lm is not None and not self.diffusion_lm.from_causal_lm
+        )
+        if (
+            self.sample_packing
+            and not native_diffusion_default
+            and not self.attn_decontaminates_packing
+        ):
+            if self.attn_implementation:
+                LOG.warning(
+                    "`sample_packing` with `attn_implementation=%r` does not handle "
+                    "cross-sample decontamination. Use a packing-capable backend "
+                    "(e.g. flash_attention_2, flex_attention, sdpa, eager) to "
+                    "isolate samples.",
+                    self.attn_implementation,
+                )
+            else:
+                LOG.warning(
+                    "`sample_packing` without an attention backend does not handle "
+                    "cross-sample decontamination. Set `attn_implementation` to a "
+                    "packing-capable backend (e.g. flash_attention_2)."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def check_scaling_softmax_requires_flex(self):
+        if self.scaling_softmax and self.attn_implementation != "flex_attention":
+            raise ValueError(
+                "scaling_softmax requires flex attention. "
+                "Add `attn_implementation: flex_attention` to your config."
+            )
+        return self
+
+
+class TrainingValidationMixin:
+    """Validation methods related to training configuration."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_batch_size_fields(cls, data):
+        fields = ("micro_batch_size", "gradient_accumulation_steps", "batch_size")
+        if data.get("micro_batch_size") or data.get("gradient_accumulation_steps"):
+            return data
+
+        if data.get("batch_size"):
+            raise ValueError(f"At least two of {', '.join(fields)} must be set")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def hint_sample_packing_padding(cls, data):
+        if data.get("sample_packing"):
+            pad_to_sequence_len = data.get("pad_to_sequence_len")
+            if pad_to_sequence_len is False:
+                LOG.warning(
+                    "`pad_to_sequence_len: true` is recommended when using sample_packing"
+                )
+            elif pad_to_sequence_len is None:
+                LOG.info(
+                    "Setting `pad_to_sequence_len: true` to prevent memory leaks when sample_packing"
+                )
+                data["pad_to_sequence_len"] = True
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def hint_reward_model_pad(cls, data):
+        if data.get("reward_model") and not data.get("pad_to_sequence_len"):
+            LOG.warning(
+                "`pad_to_sequence_len: true` is recommended when using reward_model"
+            )
+            if data.get("pad_to_sequence_len") is None:
+                data["pad_to_sequence_len"] = True
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_reward_model_defaults(cls, data):
+        if data.get("reward_model"):
+            if data.get("num_labels") is None:
+                data["num_labels"] = 1
+            if not (data.get("type_of_model") or data.get("model_type")):
+                data["model_type"] = "AutoModelForSequenceClassification"
+
+        if data.get("process_reward_model"):
+            if data.get("num_labels") is None:
+                data["num_labels"] = 2
+            if not (data.get("type_of_model") or data.get("model_type")):
+                data["model_type"] = "AutoModelForTokenClassification"
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_gas_bsz(cls, data):
+        if data.get("gradient_accumulation_steps") and data.get("batch_size"):
+            raise ValueError(
+                "please set only one of gradient_accumulation_steps or batch_size"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def hint_eval_train_mbsz(cls, data):
+        if (
+            data.get("eval_batch_size")
+            and data.get("micro_batch_size")
+            and data.get("eval_batch_size") != data.get("micro_batch_size")
+        ):
+            LOG.warning(
+                "eval_batch_size != micro_batch_size. This can lead to VRAM instability."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_warmup(cls, data):
+        if data.get("warmup_steps") and data.get("warmup_ratio"):
+            raise ValueError("warmup_steps and warmup_ratio are mutually exclusive")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_saves(cls, data):
+        if (
+            data.get("save_strategy")
+            and data.get("save_steps")
+            and data.get("save_strategy") != "steps"
+        ):
+            raise ValueError(
+                "save_strategy and save_steps mismatch. Please set save_strategy to 'steps' or remove save_steps."
+            )
+        if data.get("saves_per_epoch") and data.get("save_steps"):
+            raise ValueError(
+                "save_steps and saves_per_epoch are mutually exclusive and cannot be used together."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_checkpoint_save_retry_timeout(cls, data):
+        retry = data.get("checkpoint_save_retry")
+        if not isinstance(retry, dict):
+            return data
+        total = float(retry.get("wait_seconds", 300)) * int(retry.get("retries", 1))
+        timeout = data.get("ddp_timeout") or 1800
+        if total >= timeout:
+            LOG.warning(
+                f"checkpoint_save_retry waits up to {total:g}s on the rank whose write "
+                f"failed, while the other ranks wait at a collective that times out after "
+                f"ddp_timeout={timeout}s. Lower wait_seconds or raise ddp_timeout."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_checkpoint_mirror_dir(cls, data):
+        mirror = data.get("checkpoint_mirror")
+        mirror_dir = mirror.get("dir") if isinstance(mirror, dict) else None
+        if mirror_dir and data.get("output_dir"):
+            output_dir = Path(data["output_dir"]).expanduser().resolve()
+            target = Path(mirror_dir).expanduser().resolve()
+            if target == output_dir or target.is_relative_to(output_dir):
+                raise ValueError(
+                    "checkpoint_mirror.dir must be outside output_dir; the final copy "
+                    "would otherwise copy the mirror into itself"
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_push_save(cls, data):
+        if data.get("hub_model_id") and (
+            data.get("save_strategy") not in ["steps", "epoch", None]
+        ):
+            LOG.warning(
+                "hub_model_id is set without any models being saved. To save a model, set save_strategy."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_evals(cls, data):
+        if (
+            data.get("eval_strategy")
+            and data.get("eval_steps")
+            and data.get("eval_strategy") != "steps"
+        ):
+            raise ValueError(
+                "eval_strategy and eval_steps mismatch. Please set eval_strategy to 'steps' or remove eval_steps."
+            )
+
+        if (
+            data.get("val_set_size") == 0
+            and (data.get("eval_steps") or data.get("eval_strategy"))
+            and not data.get("test_datasets")
+            and data.get("eval_strategy") != "no"
+        ):
+            raise ValueError(
+                "eval_steps and eval_strategy are not supported with val_set_size == 0"
+            )
+        if data.get("evals_per_epoch") and data.get("eval_steps"):
+            raise ValueError(
+                "eval_steps and evals_per_epoch are mutually exclusive and cannot be used together."
+            )
+        if (
+            data.get("evals_per_epoch")
+            and data.get("eval_strategy")
+            and data.get("eval_strategy") != "steps"
+        ):
+            raise ValueError(
+                "eval_strategy must be empty or set to `steps` when used with evals_per_epoch."
+            )
+
+        if data.get("do_bench_eval") and not (
+            data.get("evals_per_epoch") or data.get("eval_steps")
+        ):
+            raise ValueError(
+                "do_bench_eval requires evals_per_epoch or eval_steps to be set."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_neftune(cls, data):
+        if data.get("noisy_embedding_alpha") and not data.get("neftune_noise_alpha"):
+            data["neftune_noise_alpha"] = data["noisy_embedding_alpha"]
+            del data["noisy_embedding_alpha"]
+        elif data.get("noisy_embedding_alpha") and data.get("neftune_noise_alpha"):
+            raise ValueError(
+                "noisy_embedding_alpha is deprecated, use neftune_noise_alpha; both are set, please remove the deprecated noisy_embedding_alpha setting"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_multipack_buffer_size(cls, data):
+        if data.get("pretrain_multipack_buffer_size") and not data.get(
+            "streaming_multipack_buffer_size"
+        ):
+            LOG.warning(
+                "`pretrain_multipack_buffer_size` is deprecated in v0.13.0, will be "
+                "removed in v0.14.0. Use `streaming_multipack_buffer_size` instead."
+            )
+            data["streaming_multipack_buffer_size"] = data[
+                "pretrain_multipack_buffer_size"
+            ]
+            del data["pretrain_multipack_buffer_size"]
+        elif data.get("pretrain_multipack_buffer_size") and data.get(
+            "streaming_multipack_buffer_size"
+        ):
+            raise ValueError(
+                "pretrain_multipack_buffer_size is deprecated, use "
+                "streaming_multipack_buffer_size; both are set, please remove the "
+                "deprecated pretrain_multipack_buffer_size setting"
+            )
+        return data
+
+    @model_validator(mode="after")
+    def check_fft_possible_bad_config(self):
+        if (
+            not (self.bf16 or self.bfloat16)
+            and (self.fp16 or self.float16)
+            and not self.adapter
+            and not self.attn_uses_flash_lib
+            and self.sample_packing
+        ):
+            LOG.warning(
+                "Full fine tune w/o FA2 w/ sample packing and fp16/float16 is likely to raise errors. Try LoRA."
+            )
+            # ValueError: Attempting to unscale FP16 gradients.
+            # OR
+            # RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != c10::Half
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_fp8_config(cls, data):
+        fp8_config = data.get("fp8_config")
+        fp8_recipe = resolve_fp8_recipe(fp8_config)
+        if fp8_config is not None and not data.get("fp8"):
+            raise ValueError(
+                "`fp8_config` requires `fp8: true`; "
+                "set `fp8: true` or remove `fp8_config`."
+            )
+        if (
+            data.get("fp8_enable_fsdp_float8_all_gather")
+            and fp8_recipe != DEFAULT_FP8_RECIPE
+        ):
+            raise ValueError(
+                "`fp8_enable_fsdp_float8_all_gather` only supports the tensorwise "
+                "`fp8_config.recipe`; disable it when using rowwise scaling."
+            )
+        if data.get("fp8") and not data.get("torch_compile"):
+            LOG.warning(
+                "torch_compile is strongly recommended for FP8 training in order to "
+                "see speed improvements. Please consider setting `torch_compile: "
+                "true` in your config."
+            )
+        fsdp_config = data.get("fsdp_config") or {}
+        if data.get("fp8") and (
+            fsdp_config.get("activation_checkpointing", False) is True
+            or fsdp_config.get("fsdp_activation_checkpointing", False) is True
+        ):
+            LOG.warning(
+                "FP8 + FSDP2 + activation checkpointing may be slower than BF16 "
+                "training. Please considering setting `activation_checkpointing: false` "
+                "in your FSDP config."
+            )
+        if data.get("fp8_enable_fsdp_float8_all_gather") and not data.get(
+            "fsdp_config"
+        ):
+            raise ValueError(
+                "fp8_enable_fsdp_float8_all_gather requires FSDP2 (fsdp_config) to be used."
+            )
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_use_reentrant_mismatch(cls, data):
+        if (
+            data.get("unfrozen_parameters")
+            and data.get("gradient_checkpointing_kwargs")
+            and data.get("gradient_checkpointing_kwargs", {}).get("use_reentrant")
+            is True
+        ):
+            # https://github.com/huggingface/transformers/issues/21381
+            raise ValueError(
+                "`use_reentrant` must be false when used with partially frozen model."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_eval_strategy(cls, data):
+        if (
+            data.get("evaluation_strategy") is not None
+            and data.get("eval_strategy") is None
+        ):
+            LOG.info(
+                "explicitly setting `eval_strategy` from the `evaluation_strategy`"
+            )
+            data["eval_strategy"] = data.get("evaluation_strategy")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_causal_lm_evals(cls, data):
+        if data.get("do_causal_lm_eval") and data.get("eval_sample_packing"):
+            raise ValueError(
+                "do_causal_lm_eval is enabled, eval_sample_packing must be set to False"
+            )
+
+        if data.get("eval_causal_lm_metrics"):
+            if not isinstance(data.get("eval_causal_lm_metrics"), list):
+                raise ValueError("eval_causal_lm_metrics must be a list")
+            # only ["sacrebleu", "comet", "ter", "chrf"] supported
+            if set(data.get("eval_causal_lm_metrics")) - SUPPORTED_METRICS:
+                raise ValueError(
+                    f"eval_causal_lm_metrics must be one of {SUPPORTED_METRICS}"
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_tokenizer_use_mistral_common(cls, data):
+        if data.get("tokenizer_use_mistral_common") is None:
+            if any(
+                "magistral" in name.lower()
+                for name in [
+                    data.get("base_model", ""),
+                    data.get("base_model_config", ""),
+                    data.get("tokenizer_config", ""),
+                ]
+            ):
+                LOG.warning(
+                    "tokenizer_use_mistral_common auto inferred to True for Magistral models. Please set it to True explicitly if you want to use mistral-common tokenizer."
+                )
+                data["tokenizer_use_mistral_common"] = True
+
+        return data
+
+    @field_validator("tokenizer_use_mistral_common", mode="after")
+    @classmethod
+    def check_mistral_common_import(cls, tokenizer_use_mistral_common):
+        if tokenizer_use_mistral_common:
+            import importlib.util
+
+            if importlib.util.find_spec("mistral_common") is None:
+                raise ImportError(
+                    "mistral-common is required for mistral models. Please install it with `pip install axolotl` or `pip install -e .`."
+                )
+
+        return tokenizer_use_mistral_common
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_mistral_common_incompatible_options(cls, data):
+        if not data.get("tokenizer_use_mistral_common"):
+            return data
+
+        # NOTE: mistral-common tokenizer is not compatible with editing tokenizer at the moment
+
+        if data.get("added_tokens_overrides"):
+            raise ValueError(
+                "added_tokens_overrides is not supported with mistral-common tokenizer"
+            )
+
+        if data.get("special_tokens"):
+            raise ValueError(
+                "special_tokens override is not supported with mistral-common tokenizer"
+            )
+
+        if data.get("tokens"):
+            raise ValueError(
+                "tokens override is not supported with mistral-common tokenizer"
+            )
+
+        if data.get("chat_template"):
+            raise ValueError(
+                "Setting chat_template is not supported with mistral-common tokenizer"
+            )
+
+        if data.get("processor_kwargs"):
+            raise ValueError(
+                "processor_kwargs is not supported with mistral-common tokenizer"
+            )
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def pretrain_with_tps(cls, data):
+        if data.get("pretraining_dataset") and data.get(
+            "include_tokens_per_second", False
+        ):
+            # combining these would raise `TypeError: cannot pickle 'dict_keys' object`
+            # due to trying to count the number of tokens total in the dataset
+            raise ValueError(
+                "pretraining_dataset and include_tokens_per_second cannot be used together."
+            )
+
+        return data
+
+
+class LoRAValidationMixin:
+    """Validation methods related to LoRA/QLoRA configuration."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_lr_groups(cls, data):
+        if data.get("lr_groups") and data.get("loraplus_lr_ratio"):
+            raise ValueError("lr_groups and loraplus_lr_ratio cannot be used together.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_frozen(cls, data):
+        if (
+            data.get("adapter")
+            and data.get("peft_layers_to_transform")
+            and data.get("unfrozen_parameters")
+        ):
+            raise ValueError(
+                "`unfrozen_parameters` used with `peft_layers_to_transform` can have unexpected behavior."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_peft_layers_pattern(cls, data):
+        if data.get("peft_layers_pattern") and not data.get("peft_layers_to_transform"):
+            raise ValueError(
+                "peft_layers_pattern requires peft_layers_to_transform to be set"
+            )
+        return data
+
+    @model_validator(mode="after")
+    def check_fused_lora(self):
+        if self.adapter in ["lora", "qlora", "mixlora"] and self.flash_attn_fuse_mlp:
+            raise ValueError("Fused modules are not supported with LoRA/QLoRA")
+        if self.adapter == "mixlora" and getattr(self, "flash_attn_fuse_qkv", False):
+            raise ValueError("flash_attn_fuse_qkv is not supported with MixLoRA")
+        if self.adapter == "mixlora" and self.rl is not None:
+            raise ValueError(
+                "MixLoRA is not compatible with RL training (DPO/KTO/GRPO). "
+                "Use adapter: lora or qlora for RL fine-tuning."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_onebitllms_lora(self):
+        if self.use_onebitllms and self.adapter in ["lora", "qlora"]:
+            raise ValueError("LoRA/QLoRA is not supported with use_onebitllms")
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def warn_qlora_zero3_w_use_reentrant(cls, data):
+        if (
+            data.get("adapter") == "qlora"
+            and data.get("gradient_checkpointing_kwargs", {})
+            and data.get("gradient_checkpointing_kwargs", {}).get("use_reentrant")
+            is False
+            and data.get("deepspeed", "") is not None
+            and "zero3" in data.get("deepspeed", "")
+        ):
+            # may result in:
+            # torch.utils.checkpoint.CheckpointError: torch.utils.checkpoint:
+            # Recomputed values for the following tensors have different metadata
+            # than during the forward pass.
+            LOG.warning(
+                "qlora + zero3 with use_reentrant: false may result in a CheckpointError about recomputed values"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_lora_kernels_8bit(cls, data):
+        if (
+            data.get("lora_mlp_kernel")
+            or data.get("lora_qkv_kernel")
+            or data.get("lora_o_kernel")
+        ):
+            if data.get("adapter") == "lora" and data.get("load_in_8bit"):
+                raise ValueError(
+                    "lora_mlp_kernel, lora_qkv_kernel, and lora_o_kernel are not "
+                    "compatible with 8-bit LoRA a the moment."
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_lora_kernels_dora(cls, data):
+        # DoRA is now supported by lora kernels
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_lora_kernels_trust_remote_code(cls, data):
+        if (
+            data.get("lora_mlp_kernel")
+            or data.get("lora_qkv_kernel")
+            or data.get("lora_o_kernel")
+        ) and data.get("trust_remote_code"):
+            from axolotl.model_support import (
+                get_model_support_for_cfg,
+                resolve_model_support,
+            )
+
+            support = get_model_support_for_cfg(DictDefault(data))
+            if (
+                support is not None
+                and resolve_model_support(support).strategies.lora_attention_cls
+                is not None
+            ):
+                return data
+            raise ValueError(
+                "lora_mlp_kernel, lora_qkv_kernel, and lora_o_kernel are not "
+                "compatible with trust_remote_code. Please disable trust_remote_code "
+                "or explicitly set lora_*_kernel to false."
+            )
+        return data
+
+
+class RLValidationMixin:
+    """Validation methods related to RL training configuration."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_sample_packing_w_rl(cls, data):
+        if data.get("sample_packing") and data.get("rl"):
+            raise ValueError("`sample_packing: true` does not work with RLHF training")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_kto_config(cls, data):
+        if data.get("rl") == "kto":
+            if data.get("sample_packing") or data.get("eval_sample_packing"):
+                raise ValueError("sample_packing is not supported with kto")
+
+            if data.get("remove_unused_columns") is not False:
+                raise ValueError("Set `remove_unused_columns: False` when using kto")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_grpo_liger_context_parallel(cls, data):
+        if (
+            data.get("rl") == "grpo"
+            and data.get("trl", {})
+            and data.get("trl").get("use_liger_loss")
+            and data.get("context_parallel_size", 1) > 1
+        ):
+            raise ValueError("GRPO + SP + Liger not currently supported")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_rl_config_gradient_checkpointing(cls, data):
+        # TODO: SalmanMohammadi
+        # Distributed RL with QLoRA + gradient checkpointing
+        # and use_reentrant = True is broken upstream in TRL
+
+        if (
+            data.get("rl")
+            and data.get("gradient_checkpointing")
+            and data.get("gradient_checkpointing_kwargs")
+            and data.get("gradient_checkpointing_kwargs").get("use_reentrant")
+            and data.get("load_in_4bit")
+            and data.get("adapter") == "qlora"
+            and data.get("capabilities")
+            and data.get("capabilities").get("n_gpu", 1) > 1
+        ):
+            raise ValueError(
+                "The `use_reentrant: True` implementation of gradient checkpointing "
+                "is not supported for distributed RL training with QLoRA. Please set "
+                "`use_reentrant: False` in `gradient_checkpointing_kwargs`."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_gdpo(cls, data):
+        if (
+            data.get("rl") == "gdpo"
+            and data.get("trl", {}).get("multi_objective_aggregation")
+            == "sum_then_normalize"
+        ):
+            raise ValueError(
+                "`multi_objective_aggregation` value set as `sum_then_normalize` => GRPO, but GDPO was selected"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_dpo(cls, data):
+        dpo_loss_type = data.get("dpo_loss_type")
+        dpo_loss_weights = data.get("dpo_loss_weights")
+        rl = data.get("rl")
+
+        if rl == "ipo":
+            LOG.warning(
+                "rl: ipo will soon be deprecated. Use `rl: dpo` with `dpo_loss_type: ['ipo']` instead."
+            )
+
+        if rl == "dpo":
+            if dpo_loss_weights is not None and dpo_loss_type is None:
+                raise ValueError(
+                    "`dpo_loss_weights` requires `dpo_loss_type` to be set"
+                )
+            if (
+                dpo_loss_type is not None
+                and dpo_loss_weights is not None
+                and len(dpo_loss_type) != len(dpo_loss_weights)
+            ):
+                raise ValueError(
+                    f"`dpo_loss_type` and `dpo_loss_weights` must be the same length, "
+                    f"but got {len(dpo_loss_type)} losses and {len(dpo_loss_weights)} weights"
+                )
+        elif dpo_loss_type is not None or dpo_loss_weights is not None:
+            raise ValueError(
+                f"`dpo_loss_type` and `dpo_loss_weights` are for DPO only,"
+                f"but got {rl=}, {dpo_loss_type=} and {dpo_loss_weights=}"
+            )
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_grpo_batch_size_divisibility(cls, data):
+        """Surface GRPO batch-shape mismatches at config-parse time.
+
+        TRL's GRPOTrainer requires that the per-step generation batch size be
+        evenly divisible by ``num_generations`` so that every prompt can be
+        replicated exactly ``num_generations`` times. The runtime check inside
+        ``GRPOTrainer.__init__`` only fires after the model has been loaded —
+        too late and too cryptic for the user. We replicate the check here so
+        the failure is immediate and actionable.
+
+        Also enforces:
+          - ``num_generations >= 2`` (group-relative advantage needs variance)
+          - ``effective_gbs >= num_generations * world_size`` when capabilities
+            indicate multiple ranks (each rank needs at least one full group)
+        """
+        if data.get("rl") != "grpo":
+            return data
+
+        trl_cfg = data.get("trl") or {}
+        num_gen = trl_cfg.get("num_generations")
+        if num_gen is None:
+            # TRL's own default is 8 — but if the user didn't set it, we
+            # don't have enough info to validate anything. Let TRL's own
+            # init handle the default-vs-batch interaction.
+            return data
+        if num_gen < 2:
+            raise ValueError(
+                f"GRPO requires `trl.num_generations >= 2` (got {num_gen}). "
+                "With num_generations=1, every group has zero advantage and "
+                "the policy never updates."
+            )
+
+        # Without `capabilities` populated yet (mode='before'), fall back to
+        # user-set distributed fields.
+        world_size = int(
+            (data.get("capabilities") or {}).get("n_gpu") or data.get("world_size") or 1
+        )
+
+        explicit_gbs = trl_cfg.get("generation_batch_size")
+        if explicit_gbs is not None:
+            effective_gbs = int(explicit_gbs)
+            gbs_source = "trl.generation_batch_size"
+        else:
+            # TRL's default is per_device_train_batch_size * num_processes *
+            # steps_per_generation, with steps_per_generation = GA.
+            mb = data.get("micro_batch_size") or 1
+            ga = data.get("gradient_accumulation_steps") or 1
+            effective_gbs = int(mb) * int(ga) * world_size
+            gbs_source = f"micro_batch_size ({mb}) * gradient_accumulation_steps ({ga})"
+            if world_size > 1:
+                gbs_source += f" * world_size ({world_size})"
+
+        if effective_gbs % num_gen != 0:
+            # Suggest the smallest GA bump that fixes it for the common case
+            # where the user hasn't set generation_batch_size explicitly.
+            hint = ""
+            if explicit_gbs is None:
+                from math import gcd
+
+                per_step = int(data.get("micro_batch_size") or 1) * world_size
+                # smallest GA such that the generation batch is a multiple of num_gen
+                lcm = num_gen * per_step // gcd(num_gen, per_step)
+                suggested_ga = lcm // per_step
+                hint = (
+                    f" Smallest fix: set `gradient_accumulation_steps: "
+                    f"{suggested_ga}` (so the generation batch size "
+                    f"{per_step * suggested_ga} is a multiple of {num_gen})."
+                )
+            raise ValueError(
+                f"GRPO: generation batch size must be divisible by "
+                f"`trl.num_generations`. Got effective_gbs={effective_gbs} "
+                f"(from {gbs_source}) and num_generations={num_gen}.{hint}"
+            )
+
+        # Multi-rank check: each rank must receive at least one full group
+        # per step.
+        if world_size > 1 and effective_gbs < num_gen * world_size:
+            raise ValueError(
+                f"GRPO with world_size={world_size} requires effective_gbs "
+                f">= num_generations * world_size = {num_gen * world_size}, "
+                f"got {effective_gbs}. Increase gradient_accumulation_steps "
+                f"or micro_batch_size."
+            )
+
+        return data
+
+
+STAGED_NF4_CONSTRAINTS = [
+    (
+        lambda self: (
+            not self.load_in_4bit or self.adapter != "qlora" or self.load_in_8bit
+        ),
+        "CPU-staged NF4 requires adapter: qlora and load_in_4bit: true",
+    ),
+    (
+        lambda self: (
+            bool(self.fsdp_config)
+            and (
+                not self.fsdp_config.cpu_ram_efficient_loading
+                or not self.qlora_sharded_model_loading
+            )
+        ),
+        "CPU-staged NF4 requires FSDP2, cpu_ram_efficient_loading and qlora_sharded_model_loading",
+    ),
+    (
+        lambda self: (
+            bool(self.deepspeed)
+            or (self.tensor_parallel_size or 1) > 1
+            or (self.context_parallel_size or 1) > 1
+        ),
+        "CPU-staged NF4 does not support DeepSpeed, tensor or context parallelism",
+    ),
+    (
+        lambda self: (self.dp_replicate_size or 1) > 1,
+        "CPU-staged NF4 requires a one-dimensional sharding mesh; dp_replicate_size must be 1",
+    ),
+    (
+        lambda self: (
+            (self.bnb_config_kwargs or {}).get("bnb_4bit_quant_type", "nf4") != "nf4"
+        ),
+        "CPU-staged NF4 requires bnb_4bit_quant_type: nf4",
+    ),
+    (
+        lambda self: (
+            self.nf4_backend == "torchao"
+            and (
+                (self.bnb_config_kwargs or {}).get("blocksize", 64) != 64
+                or not (self.bnb_config_kwargs or {}).get(
+                    "bnb_4bit_use_double_quant", True
+                )
+            )
+        ),
+        "torchao NF4 requires blocksize 64 and double quantization",
+    ),
+    (
+        lambda self: bool(self.peft_use_dora or self.lora_modules_to_save),
+        "CPU-staged NF4 currently requires LoRA without DoRA or modules_to_save",
+    ),
+    (
+        lambda self: (
+            self.peft_init_lora_weights not in VALUE_INDEPENDENT_LORA_INIT
+            or bool(self.peft and self.peft.loftq_config)
+        ),
+        "CPU-staged NF4 does not support a value-dependent LoRA init: pissa, olora "
+        "and loftq residualize the base weight, and a packed base cannot take the "
+        "residual write-back; corda and eva are not wired for staged loading. olora "
+        "works on the non-staged bitsandbytes loader "
+        "(fsdp_config.cpu_ram_efficient_loading: false); pissa and loftq need an "
+        "unquantized base.",
+    ),
+]
+
+
+class OptimizationValidationMixin:
+    """Validation methods related to optimization and performance."""
+
+    @model_validator(mode="after")
+    def check_adamw_optimizer_params(self):
+        if any([self.adam_beta1, self.adam_beta2, self.adam_epsilon]) and (
+            not self.optimizer or "adamw" not in str(self.optimizer).lower()
+        ):
+            LOG.warning("adamw hyperparameters found, but no adamw optimizer set")
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_muon_deepspeed_fsdp(cls, data):
+        if data.get("optimizer") in ("muon", "muon_8bit"):
+            if data.get("deepspeed"):
+                raise ValueError(
+                    "Muon optimizer is currently incompatible with DeepSpeed"
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_polora(cls, data):
+        if data.get("optimizer") != "polora":
+            return data
+        if data.get("adapter") not in ("lora", "qlora"):
+            raise ValueError(
+                "polora only updates LoRA (A, B) factors and requires "
+                "adapter: lora or qlora."
+            )
+        if data.get("deepspeed") or (data.get("tensor_parallel_size") or 1) > 1:
+            # ZeRO partitions the optimizer step itself, and TP shards the rank dim;
+            # polora needs whole factors to build its r x r curvature matrices.
+            raise ValueError(
+                "polora is not compatible with DeepSpeed or tensor parallelism. "
+                "Use single-GPU, DDP, or FSDP2."
+            )
+
+        untrained = [
+            key
+            for key in (
+                "lora_modules_to_save",
+                "unfrozen_parameters",
+                "peft_use_dora",
+                "peft_trainable_token_indices",
+                "lisa_step_interval",
+                "reward_model",
+                "process_reward_model",
+            )
+            if data.get(key)
+        ]
+        if untrained:
+            raise ValueError(
+                f"polora has no fallback optimizer, so the parameters added by {untrained} "
+                "would never be trained. Remove them or pick a different optimizer."
+            )
+
+        # The factory builds the optimizer straight from the model, bypassing axolotl's
+        # parameter grouping, so per-group learning rates never take effect.
+        ignored_lrs = [
+            key
+            for key in (
+                "loraplus_lr_ratio",
+                "lr_groups",
+                "embedding_lr",
+                "embedding_lr_scale",
+            )
+            if data.get(key)
+        ]
+        if ignored_lrs:
+            raise ValueError(
+                f"polora sets its own per-factor step size, so {ignored_lrs} would be "
+                "silently ignored. Remove them or pick a different optimizer."
+            )
+
+        if data.get("relora"):
+            raise ValueError(
+                "relora resets optimizer state through Optimizer.state, which polora "
+                "does not use, so its momentum would survive every merge."
+            )
+        if data.get("weight_decay"):
+            LOG.warning("polora has no weight decay term; weight_decay is ignored.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_qgalore(cls, data):
+        if data.get("optimizer") != "q_galore_adamw8bit":
+            return data
+        adapter = data.get("adapter")
+        if adapter:
+            raise ValueError(
+                "q_galore_adamw8bit operates on full-precision parameters and is "
+                f"incompatible with adapter='{adapter}'. Remove the adapter setting "
+                "or pick a different optimizer."
+            )
+        if data.get("deepspeed"):
+            raise ValueError(
+                "q_galore_adamw8bit is not yet validated with DeepSpeed. "
+                "Use DDP or FSDP2."
+            )
+        if not (data.get("bf16") or data.get("bfloat16") or data.get("fp16")):
+            LOG.warning(
+                "q_galore_adamw8bit benefits from mixed-precision (bf16/fp16). "
+                "Running in fp32 will negate most of the memory savings."
+            )
+        if data.get("optim_target_modules") is None:
+            # Match the reference impl's defaults: attention + MLP linears.
+            data["optim_target_modules"] = [
+                "attn",
+                "mlp",
+            ]
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_flashoptim_deepspeed_fsdp(cls, data):
+        optimizer = data.get("optimizer") or ""
+        if str(optimizer).startswith("flash_"):
+            if data.get("deepspeed"):
+                raise ValueError(
+                    f"{optimizer} optimizer is incompatible with DeepSpeed. "
+                    "Flash optimizers only support DDP and FSDP2."
+                )
+        return data
+
+    @model_validator(mode="after")
+    def check_batch_flattening_fa(self):
+        if not self.batch_flattening:
+            return self
+
+        batch_flattening_auto = self.batch_flattening == "auto"
+        has_varlen_attn = self.attn_supports_packing or (
+            self.attn_implementation == "varlen"
+        )
+
+        if not has_varlen_attn and not batch_flattening_auto:
+            raise ValueError(
+                "batch_flattening requires a varlen-capable attention backend "
+                "(e.g., attn_implementation: flash_attention_2)."
+            )
+        if self.sample_packing and not batch_flattening_auto:
+            raise ValueError("batch_flattening not compatible with sample_packing")
+        if self.micro_batch_size == 1 and not batch_flattening_auto:
+            LOG.warning("batch_flattening has no effect with micro_batch_size == 1")
+
+        # Liger loss takes a separate code path (compute_liger_loss) that
+        # bypasses the flattened training forward pass. Batch flattening
+        # still applies to the scoring/deferred logprobs path.
+        if self.trl and getattr(self.trl, "use_liger_loss", False):
+            LOG.warning(
+                "batch_flattening with use_liger_loss: flattening will only "
+                "apply to the scoring path (deferred logprobs). The training "
+                "forward pass uses Liger's fused lm_head+loss kernel instead."
+            )
+
+        if (
+            batch_flattening_auto
+            and has_varlen_attn
+            and not self.sample_packing
+            and self.micro_batch_size > 1
+        ):
+            self.batch_flattening = True
+        elif batch_flattening_auto:
+            self.batch_flattening = False
+
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_cross_entropy_conflicts(cls, data):
+        """Check for mutual exclusivity between cross entropy patch options.
+
+        Only one of the following can be enabled at a time:
+        - cut_cross_entropy (CutCrossEntropyPlugin)
+        - chunked_cross_entropy
+        - liger_cross_entropy (LigerPlugin)
+        - liger_fused_linear_cross_entropy (LigerPlugin)
+        """
+        ce_options = {
+            "cut_cross_entropy": data.get("cut_cross_entropy"),
+            "chunked_cross_entropy": data.get("chunked_cross_entropy"),
+            "liger_cross_entropy": data.get("liger_cross_entropy"),
+            "liger_fused_linear_cross_entropy": data.get(
+                "liger_fused_linear_cross_entropy"
+            ),
+        }
+
+        enabled_options = [k for k, v in ce_options.items() if v]
+
+        if len(enabled_options) > 1:
+            raise ValueError(
+                f"Only one cross entropy optimization can be enabled at a time. "
+                f"Found {len(enabled_options)} enabled: {', '.join(enabled_options)}. "
+                "Please disable all but one."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_custom_loss_conflicts(cls, data):
+        custom_losses = [k for k in ("use_dft", "use_eaft") if data.get(k)]
+        if not custom_losses:
+            return data
+        if len(custom_losses) > 1:
+            raise ValueError("`use_dft` and `use_eaft` cannot be enabled together.")
+
+        # labels are popped before forward: fused/chunked CE never runs, CP shards logits but not labels
+        conflicts = [
+            k
+            for k in (
+                "rl",
+                "reward_model",
+                "process_reward_model",
+                "cut_cross_entropy",
+                "liger_fused_linear_cross_entropy",
+                "chunked_cross_entropy",
+            )
+            if data.get(k)
+        ]
+        cp_size = (
+            data.get("context_parallel_size")
+            or data.get("sequence_parallel_degree")
+            or 1
+        )
+        if cp_size > 1:
+            conflicts.append("context_parallel_size > 1")
+        if conflicts:
+            raise ValueError(
+                f"`{custom_losses[0]}` is an SFT-only loss and cannot be combined "
+                f"with: {', '.join(conflicts)}."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_fsdp_version(cls, data):
+        if data.get("fsdp"):
+            raise ValueError(
+                "The top-level `fsdp` list is no longer supported, it configured "
+                "FSDP1 sharding strategies. Use `fsdp_config` instead, see "
+                f"{FSDP1_MIGRATION_DOCS} for the migration guide."
+            )
+        fsdp_config = data.get("fsdp_config") or {}
+        for version in (
+            data.get("fsdp_version"),
+            fsdp_config.get("fsdp_version"),
+            fsdp_config.get("version"),
+        ):
+            if version is not None and str(version) != "2":
+                raise ValueError(
+                    f"fsdp_version: {version} is no longer supported, FSDP1 has been "
+                    f"removed from Axolotl. Use fsdp_version: 2 and see "
+                    f"{FSDP1_MIGRATION_DOCS} for the migration guide."
+                )
+
+        for key in list(fsdp_config.keys()):
+            # the `fsdp_` prefix is stripped by another validator, which may not have run yet
+            name = key[5:] if key.startswith("fsdp_") and key != "fsdp_version" else key
+            if name in FSDP1_ONLY_REJECTED_KEYS:
+                replacement = FSDP1_ONLY_REJECTED_KEYS[name]
+                replacement_hint = (
+                    f"Use `{replacement}` instead"
+                    if replacement
+                    else "It has no FSDP2 equivalent, please remove it"
+                )
+                raise ValueError(
+                    f"fsdp_config.{name} is an FSDP1-only option and FSDP1 has been "
+                    f"removed from Axolotl. {replacement_hint}. See "
+                    f"{FSDP1_MIGRATION_DOCS} for the migration guide."
+                )
+            if name in FSDP1_ONLY_IGNORED_KEYS:
+                LOG.warning(
+                    f"fsdp_config.{name} is an FSDP1-only option and is ignored under "
+                    f"FSDP2. Dropping it, see {FSDP1_MIGRATION_DOCS}."
+                )
+                fsdp_config.pop(key)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_fsdp2_cpu_offload_pin_memory(cls, data):
+        if not (fsdp_config := data.get("fsdp_config")):
+            return data
+
+        if fsdp_config.get("cpu_offload_pin_memory") is False:
+            if not fsdp_config.get("offload_params"):
+                raise ValueError(
+                    "disabling cpu_offload_pin_memory requires enabling offload_params"
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_fsdp2_base_model_quant_rl(cls, data):
+        if data.get("fsdp_config") and data.get("rl") in [
+            RLType.DPO,
+            RLType.KTO,
+            RLType.ORPO,
+            RLType.IPO,
+        ]:
+            if data.get("load_in_8bit") or data.get("load_in_4bit"):
+                raise ValueError(
+                    f"FSDP2 does not support load_in_8bit or load_in_4bit with {data.get('rl')}. Please use DeepSpeed instead."
+                )
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_fsdp_config_kwargs_prefix(cls, data):
+        if fsdp_config := data.get("fsdp_config"):
+            should_fix = False
+            for key, _ in fsdp_config.items():
+                if key.startswith("fsdp_") and key != "fsdp_version":
+                    should_fix = True
+                    LOG.warning_once(
+                        "Configuring FSDP fields with the `fsdp_` prefix is deprecated. "
+                        "Please omit the `fsdp_` prefix from the any fields in `fsdp_config`."
+                    )
+            if should_fix:
+                update_fsdp_config = {}
+                for key, value in fsdp_config.items():
+                    if key.startswith("fsdp_") and key != "fsdp_version":
+                        update_fsdp_config[key.replace("fsdp_", "")] = value
+                    else:
+                        update_fsdp_config[key] = value
+                data["fsdp_config"] = update_fsdp_config
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_fsdp_version_in_fsdp_config(cls, data):
+        fsdp_config = data.get("fsdp_config") or {}
+        fsdp_version = data.get("fsdp_version", None)
+        if not fsdp_version and fsdp_config and fsdp_config.get("version"):
+            fsdp_cfg_version = fsdp_config.pop("version")
+            data["fsdp_version"] = fsdp_cfg_version
+            data["fsdp_config"]["fsdp_version"] = fsdp_cfg_version
+        elif not fsdp_version and fsdp_config and fsdp_config.get("fsdp_version"):
+            data["fsdp_version"] = fsdp_config.get("fsdp_version")
+        if fsdp_version and fsdp_config and not fsdp_config.get("fsdp_version"):
+            data["fsdp_config"]["fsdp_version"] = fsdp_version
+        if fsdp_config and not data.get("fsdp_version"):
+            data["fsdp_version"] = 2
+            data["fsdp_config"]["fsdp_version"] = 2
+        return data
+
+    @model_validator(mode="after")
+    def check_fsdp2_w_8bit_optimizer(self):
+        if (
+            hasattr(self, "fsdp_config")
+            and self.fsdp_config
+            and self.optimizer
+            and "8bit" in str(self.optimizer)
+        ):
+            if self.optimizer in ["adamw_8bit", "adamw_bnb_8bit"]:
+                # CUDA ops errors with bnb 8bit optimizer + FSDP2
+                raise ValueError(
+                    f"FSDP2 not compatible with {self.optimizer}, use `adamw_torch_8bit` instead"
+                )
+
+        return self
+
+    @model_validator(mode="after")
+    def check_fsdp2_cpu_ram_efficient_loading_w_4bit(self):
+        if self.qlora_sharded_model_loading is None:
+            self.qlora_sharded_model_loading = bool(
+                self.fsdp_config
+                and self.adapter == "qlora"
+                and self.load_in_4bit
+                and self.fsdp_config.cpu_ram_efficient_loading
+            )
+        # nf4 quantizes on rank 0 only: its params keep the packed `(N, 1)` shape there while the
+        # other ranks stay on meta unpacked, so the FSDP2 load scatters mismatched sizes.
+        if (
+            self.fsdp_config
+            and self.fsdp_config.cpu_ram_efficient_loading
+            and self.load_in_4bit
+            and not self.qlora_sharded_model_loading
+        ):
+            raise ValueError(
+                "FSDP2 does not support `cpu_ram_efficient_loading` with load_in_4bit; the "
+                "rank-0-only bitsandbytes quantization deadlocks the state dict scatter. "
+                "Set `qlora_sharded_model_loading: true` for CPU-staged loading, "
+                "or set `fsdp_config.cpu_ram_efficient_loading` to false."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_bnb_blocksize(self):
+        if (
+            self.load_in_4bit
+            and self.nf4_backend != "torchao"
+            and (self.bnb_config_kwargs or {}).get("blocksize", 64) != 64
+        ):
+            raise ValueError(
+                "bitsandbytes 4-bit loading always quantizes with blocksize 64; "
+                "remove `bnb_config_kwargs.blocksize` or set it to 64."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_staged_nf4(self):
+        staged = self.nf4_backend == "torchao" or (
+            self.qlora_sharded_model_loading and self.load_in_4bit
+        )
+        if not staged:
+            return self
+        if (
+            self.nf4_backend != "torchao"
+            and self.fsdp_config
+            and not self.fsdp_config.cpu_ram_efficient_loading
+        ):
+            # this combination never reached a sharded loader, so keep it inert
+            # rather than failing configs that used to train
+            LOG.warning(
+                "`qlora_sharded_model_loading: true` has no effect without "
+                "`fsdp_config.cpu_ram_efficient_loading: true`; every rank will load "
+                "and quantize the full model. Enable cpu_ram_efficient_loading for "
+                "CPU-staged NF4 loading."
+            )
+            self.qlora_sharded_model_loading = False
+            return self
+        if self.nf4_backend != "torchao" and not self.fsdp_config:
+            LOG.warning(
+                "`qlora_sharded_model_loading: true` has no effect without an "
+                "`fsdp_config`; every rank will load and quantize the full model."
+            )
+            self.qlora_sharded_model_loading = False
+            return self
+        for violates, message in STAGED_NF4_CONSTRAINTS:
+            if violates(self):
+                raise ValueError(message)
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_tensor_parallel_size_update_ds_json(cls, data):
+        tensor_parallel_size = data.get("tensor_parallel_size")
+        if tensor_parallel_size is not None and tensor_parallel_size > 1:
+            if data.get("deepspeed"):
+                with open(data.get("deepspeed"), "r", encoding="utf-8") as ds_fin:
+                    ds_config = json.load(ds_fin)
+                    should_save = False
+                    if "tensor_parallel" not in ds_config:
+                        ds_config["tensor_parallel"] = {
+                            "autotp_size": tensor_parallel_size
+                        }
+                        should_save = True
+                    if (
+                        "gather_16bit_weights_on_model_save"
+                        not in ds_config["zero_optimization"]
+                    ):
+                        ds_config["zero_optimization"][
+                            "gather_16bit_weights_on_model_save"
+                        ] = True
+                        should_save = True
+                    if should_save:
+                        temp_dir = tempfile.mkdtemp()
+                        with open(
+                            Path(temp_dir) / "autotp_ds.json", "w", encoding="utf-8"
+                        ) as ds_fout:
+                            json.dump(ds_config, ds_fout, indent=4)
+                        data["deepspeed"] = str(Path(temp_dir) / "autotp_ds.json")
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_deepcompile(cls, data):
+        deepcompile = data.get("deepcompile")
+        if deepcompile:
+            if not data.get("deepspeed"):
+                raise ValueError("DeepCompile is only supported with DeepSpeed")
+            with open(data.get("deepspeed"), "r", encoding="utf-8") as ds_fin:
+                ds_config = json.load(ds_fin)
+                if "compile" not in ds_config:
+                    ds_config["compile"] = {"deepcompile": True}
+                    temp_dir = tempfile.mkdtemp()
+                    with open(
+                        Path(temp_dir) / "deepcompile_ds.json", "w", encoding="utf-8"
+                    ) as ds_fout:
+                        json.dump(ds_config, ds_fout, indent=4)
+                    data["deepspeed"] = str(Path(temp_dir) / "deepcompile_ds.json")
+
+        return data
+
+
+class SystemValidationMixin:
+    """Validation methods related to system and hardware configuration."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_mem_mismatch(cls, data):
+        if (
+            data.get("max_memory") is not None
+            and data.get("gpu_memory_limit") is not None
+        ):
+            raise ValueError(
+                "max_memory and gpu_memory_limit are mutually exclusive and cannot be used together."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_fsdp_deepspeed(cls, data):
+        if data.get("deepspeed") and data.get("fsdp_config"):
+            raise ValueError("deepspeed and fsdp cannot be used together.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_model_quantization_config_vs_bnb(cls, data):
+        if data.get("model_quantization_config"):
+            if data.get("load_in_8bit") or data.get("load_in_4bit"):
+                raise ValueError(
+                    "model_quantization_config and load_in_8bit or load_in_4bit cannot be used together."
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_npu_config(cls, data):
+        if is_torch_npu_available():
+            # check attention config
+            unsupported_npu_impls = {
+                "flash_attention_2",
+                "flash_attention_3",
+                "flash_attention_4",
+                "flash_attention_torch",
+                "sdpa",
+            }
+            attn_impl = data.get("attn_implementation")
+            if attn_impl and attn_impl in unsupported_npu_impls:
+                raise NotImplementedError(
+                    f"attn_implementation={attn_impl!r} is currently not supported on Ascend NPU."
+                )
+            # Legacy flags still present at this point (normalizer strips them later).
+            attn_list = ["flash_attention", "sdp_attention"]
+            for attn in attn_list:
+                if data.get(attn):
+                    raise NotImplementedError(
+                        f"{attn} is currently not supported in Ascend npu, please disable this configuration."
+                    )
+
+            # check quant config
+            if data.get("optimizer") is not None and "bit" in data.get("optimizer"):
+                optimizer = data.get("optimizer")
+                raise NotImplementedError(
+                    f"{optimizer} is currently not supported in Ascend npu, choose another one please."
+                )
+
+            quant_list = ["load_in_8bit", "load_in_4bit"]
+            for quant in quant_list:
+                if data.get(quant):
+                    raise NotImplementedError(
+                        f"Quantification is currently not supported in Ascend npu, please disable {quant}."
+                    )
+
+            # check dtype config
+            if data.get("tf32"):
+                raise NotImplementedError(
+                    "tf32 dtype is currently not supported in Ascend npu, please disable this configuration"
+                )
+
+        return data
+
+    @model_validator(mode="after")
+    def check_flash_attn_available(self):
+        if self.attn_implementation not in ("flash_attention_2", "flash_attention_3"):
+            return self
+
+        import torch
+
+        # CPU-only boxes may just be preprocessing for a GPU box; don't block them.
+        if not torch.cuda.is_available():
+            return self
+
+        from transformers.integrations.hub_kernels import allow_all_hub_kernels
+        from transformers.utils import (
+            is_flash_attn_2_available,
+            is_flash_attn_3_available,
+        )
+
+        # kernels_fallback_ok mirrors runtime resolution: the flash-attn package OR a
+        # kernels-hub binary matching this torch build.
+        if self.attn_implementation == "flash_attention_3":
+            checker = is_flash_attn_3_available
+        else:
+            checker = is_flash_attn_2_available
+        with allow_all_hub_kernels():
+            available = checker(kernels_fallback_ok=True)
+        reason = None
+        if not available:
+            with allow_all_hub_kernels():
+                reason = _flash_attn_kernel_failure(self.attn_implementation)
+            if reason is None:
+                # the hub kernel loads: transformers' probe hit a transient (its
+                # version lookup lists repo refs over the network and any
+                # exception reads as "unavailable"); drop the cached verdict
+                cache_clear = getattr(checker, "cache_clear", None)
+                if cache_clear is not None:
+                    cache_clear()
+                available = True
+        if not available:
+            raise ValueError(
+                f"attn_implementation: {self.attn_implementation} is set, but no "
+                "flash-attn build is available in this environment: the flash-attn "
+                "package is not installed and the kernels hub has no prebuilt binary "
+                f"for torch {torch.__version__}. Install a flash-attn build matching "
+                "your torch version, or set `attn_implementation: sdpa`."
+                + (f" The kernels hub lookup failed with: {reason}" if reason else "")
+            )
+        return self
+
+
+class ChatTemplateValidationMixin:
+    """Validation methods related to chat template configuration."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_chat_template_config(cls, data):
+        # if chat_template is set to jinja, chat_template_jinja is required
+        if data.get("chat_template") == ChatTemplate.jinja and not data.get(
+            "chat_template_jinja"
+        ):
+            raise ValueError(
+                "chat_template_jinja is required when chat_template is set to 'jinja'. "
+                "Please provide the Jinja template string in chat_template_jinja field."
+            )
+
+        # If chat_template_jinja is set, set chat_template to jinja
+        if data.get("chat_template_jinja") and not data.get("chat_template"):
+            data["chat_template"] = ChatTemplate.jinja
+
+        return data
+
+
+class PretrainingValidationMixin:
+    """Validation methods related to pretraining configuration."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_pretraining_w_max_steps(cls, data):
+        if data.get("pretraining_dataset") and not data.get("max_steps"):
+            raise ValueError(
+                "max_steps must be set when using iterable pretraining_dataset, Trainer can't infer length and schedule optimizer/learning rate without it!"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_pretraining_w_group_by_length(cls, data):
+        if data.get("pretraining_dataset") and data.get("group_by_length"):
+            LOG.warning(
+                "You probably want to disable group_by_length as it will force a streamed dataset to download completely."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_pretraining_split_batches_accelerate(cls, data):
+        # alternatively set ACCELERATE_SPLIT_BATCHES=False
+        if data.get("pretraining_dataset"):
+            accelerator_config = data.get("accelerator_config", {})
+            if not accelerator_config:
+                data["accelerator_config"] = {
+                    "split_batches": False,
+                    "dispatch_batches": False,
+                }
+            else:
+                if accelerator_config.get("split_batches") is None:
+                    data["accelerator_config"]["split_batches"] = False
+                if accelerator_config.get("dispatch_batches") is None:
+                    data["accelerator_config"]["dispatch_batches"] = False
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_pretraining_w_val_set_size(cls, data):
+        if data.get("pretraining_dataset") and data.get("val_set_size"):
+            raise ValueError(
+                "val_set_size is not supported with pretraining_dataset. "
+                "Use test_datasets to specify evaluation datasets for pretraining."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_streaming_w_val_set_size(cls, data):
+        if data.get("streaming") and data.get("val_set_size"):
+            raise ValueError(
+                "val_set_size is not supported with streaming datasets. "
+                "Use test_datasets to specify evaluation datasets when streaming is enabled."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_streaming_w_max_steps(cls, data):
+        if data.get("streaming") and not data.get("max_steps"):
+            raise ValueError(
+                "max_steps must be set when using streaming datasets. "
+                "Trainer cannot infer dataset length for iterable datasets."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_streaming_w_multiple_datasets(cls, data):
+        if (
+            data.get("streaming")
+            and data.get("sample_packing")
+            and data.get("datasets")
+            and len(data.get("datasets")) > 1
+        ):
+            raise NotImplementedError(
+                "Sample packing with multiple streaming datasets is not yet supported"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_streaming_w_dataset_weight(cls, data):
+        if data.get("streaming") and data.get("datasets"):
+            for ds_cfg in data["datasets"]:
+                weight = (
+                    ds_cfg.get("weight")
+                    if isinstance(ds_cfg, dict)
+                    else getattr(ds_cfg, "weight", None)
+                )
+                if weight is not None and weight < 1.0:
+                    LOG.warning(
+                        "Dataset weight is not supported with streaming datasets and will be ignored. "
+                        "Use non-streaming mode for weighted dataset mixing."
+                    )
+                    break
+        return data
+
+
+class ModelCompatibilityValidationMixin:
+    """Validation methods for specific model compatibility."""
+
+    @model_validator(mode="after")
+    def check_falcon_fsdp(self):
+        if (
+            self.base_model and "falcon" in self.base_model.lower()
+        ) and self.fsdp_config:
+            raise ValueError("FSDP is not supported for falcon models")
+        return self
+
+    @model_validator(mode="after")
+    def check_mpt_checkpointing(self):
+        if (
+            self.base_model and "mpt" in self.base_model.lower()
+        ) and self.gradient_checkpointing:
+            raise ValueError("gradient_checkpointing is not supported for MPT models")
+        return self
+
+    @model_validator(mode="after")
+    def check_gradient_checkpointing_w_offload(self):
+        if self.gradient_checkpointing == "offload":
+            LOG.warning(
+                "`offload` is deprecated for gradient_checkpointing, use `activation_offloading: true` or `activation_offloading: legacy`"
+            )
+            self.gradient_checkpointing = True
+            LOG.warning(
+                "`offload` now uses a new stream implementation; to use the previous implementation, use `activation_offloading: legacy`"
+            )
+            self.activation_offloading = True
+        if self.gradient_checkpointing == "offload_disk":
+            LOG.warning(
+                "`offload_disk` is deprecated for gradient_checkpointing, use `activation_offloading: disk`"
+            )
+            self.gradient_checkpointing = True
+            self.activation_offloading = "disk"
+        return self
+
+    @model_validator(mode="after")
+    def check_activation_offloading_wo_gc(self):
+        if self.activation_offloading and not self.gradient_checkpointing:
+            raise ValueError("activation_offloading requires gradient_checkpointing")
+        return self
+
+    @model_validator(mode="after")
+    def check_selective_checkpointing(self):
+        if not self.selective_checkpointing:
+            self.selective_checkpointing = None
+            return self
+        if self.selective_checkpointing is True:
+            from axolotl.utils.schemas.training import SelectiveCheckpointingConfig
+
+            self.selective_checkpointing = SelectiveCheckpointingConfig()
+        if not self.gradient_checkpointing:
+            raise ValueError("selective_checkpointing requires gradient_checkpointing")
+        if (self.gradient_checkpointing_kwargs or {}).get("use_reentrant"):
+            raise ValueError(
+                "selective_checkpointing requires non-reentrant checkpointing "
+                "(gradient_checkpointing_kwargs.use_reentrant: false)"
+            )
+        if self.activation_offloading and self.activation_offloading != "hidden_states":
+            raise ValueError(
+                "selective_checkpointing is only compatible with "
+                "activation_offloading: hidden_states (or false); the TRL offloader "
+                "paths bypass HF gradient checkpointing"
+            )
+        sac = self.selective_checkpointing
+        fused_lora = any(
+            _lora_kernel_enabled(self, flag)
+            for flag in ("lora_mlp_kernel", "lora_qkv_kernel", "lora_o_kernel")
+        )
+        if fused_lora:
+            matmul_ops = ("aten::mm", "aten::addmm", "aten::matmul", "aten::bmm")
+            bad = [
+                spec
+                for spec in sac.save
+                if spec != "attention" and any(spec in op for op in matmul_ops)
+            ]
+            if bad:
+                raise ValueError(
+                    f"selective_checkpointing.save entries {bad} match matmul ops, "
+                    "which cannot be saved while a fused LoRA kernel is enabled: the "
+                    "kernel adds the adapter delta into the base matmul output "
+                    "in-place (addmm_), which invalidates the cached tensor. Set "
+                    "lora_mlp_kernel: false, lora_qkv_kernel: false and "
+                    "lora_o_kernel: false (they are auto-enabled for LoRA/QLoRA), "
+                    "or use save: [attention]."
+                )
+            if sac.save_matmul_min_k:
+                raise ValueError(
+                    "selective_checkpointing.save_matmul_min_k saves the base matmul "
+                    "that a fused LoRA kernel then mutates in-place (addmm_). Set "
+                    "lora_mlp_kernel: false, lora_qkv_kernel: false and "
+                    "lora_o_kernel: false (they are auto-enabled for LoRA/QLoRA), "
+                    "or drop save_matmul_min_k."
+                )
+        for flag, modules in _SAC_FUSED_MODULE_COVERAGE:
+            enabled = (
+                _lora_kernel_enabled(self, flag)
+                if flag.startswith("lora_")
+                else bool(getattr(self, flag, None))
+            )
+            if not enabled:
+                continue
+            for entry in sac.save_modules or []:
+                if any(_sac_entry_covers(entry, module) for module in modules):
+                    raise ValueError(
+                        f"selective_checkpointing.save_modules entry {entry!r} names "
+                        f"a module whose forward is replaced by {flag}: true, so its "
+                        "hooks never fire and the rule would be a silent no-op. Set "
+                        f"{flag}: false (LoRA kernels are auto-enabled for "
+                        "LoRA/QLoRA) or remove the entry."
+                    )
+                if flag.startswith("lora_") and _sac_entry_is_layer_container(entry):
+                    raise ValueError(
+                        f"selective_checkpointing.save_modules entry {entry!r} scopes "
+                        "a decoder layer or model container, which holds the "
+                        f"projections {flag}: true runs; the kernel adds the adapter "
+                        "delta into their saved base matmul output in-place "
+                        f"(addmm_), which invalidates the cached tensor. Set {flag}: "
+                        "false (LoRA kernels are auto-enabled for LoRA/QLoRA) or name "
+                        "a projection the kernel does not cover."
+                    )
+        if self.torch_compile:
+            LOG.warning(
+                "selective_checkpointing with torch_compile is untested in axolotl; "
+                "the SAC context_fn targets the eager checkpointing path"
+            )
+        return self
+
+    def _resolved_expert_parallel_backend(self) -> str | None:
+        backend = getattr(self, "expert_parallel_backend", None)
+        if backend == "auto":
+            from importlib.util import find_spec
+
+            backend = "deep_ep" if find_spec("deep_ep") is not None else "torch"
+        return backend
+
+    @model_validator(mode="after")
+    def check_torch_compile_regional_with_gradient_checkpointing(self):
+        if (
+            self.torch_compile
+            and self.torch_compile_regional
+            and self.gradient_checkpointing
+        ):
+            raise ValueError(
+                "torch_compile_regional cannot be combined with gradient_checkpointing: "
+                "the checkpoint recompute can run a different Dynamo cache entry than "
+                "the forward (pytorch/pytorch#166926). Use whole-model compile."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_torch_expert_parallel_checkpointing(self):
+        if (getattr(self, "expert_parallel_size", 1) or 1) <= 1:
+            return self
+        if self._resolved_expert_parallel_backend() != "torch":
+            return self
+        # recompute has to replay the forward's routing through a SAC policy
+        if self.gradient_checkpointing and (
+            self.gradient_checkpointing_kwargs or {}
+        ).get("use_reentrant"):
+            raise ValueError(
+                "expert_parallel_backend: torch requires non-reentrant gradient "
+                "checkpointing (gradient_checkpointing_kwargs.use_reentrant: false): "
+                "recompute must reuse the forward's routing, which reentrant "
+                "checkpointing cannot guarantee"
+            )
+        if self.gradient_checkpointing and self.activation_offloading in (
+            True,
+            "legacy",
+            "disk",
+        ):
+            raise ValueError(
+                "expert_parallel_backend: torch is incompatible with activation_offloading "
+                f"{self.activation_offloading!r}: the TRL offloader bypasses the "
+                "checkpointing policy that keeps recompute on the forward's routing. "
+                "Use activation_offloading: hidden_states or false."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_expert_parallel_dispatch_chunks(self):
+        chunks = getattr(self, "expert_parallel_dispatch_chunks", None) or 1
+        if chunks > 1 and self._resolved_expert_parallel_backend() == "deep_ep":
+            raise ValueError(
+                "expert_parallel_dispatch_chunks > 1 requires expert_parallel_backend: "
+                "torch (DeepEP dispatches the whole batch in one fused kernel)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_hidden_states_offloading(self):
+        if self.activation_offloading != "hidden_states":
+            return self
+        gc_kwargs = dict(self.gradient_checkpointing_kwargs or {})
+        use_reentrant = gc_kwargs.setdefault("use_reentrant", False)
+        self.gradient_checkpointing_kwargs = gc_kwargs
+        if use_reentrant and self.unfrozen_parameters:
+            raise ValueError(
+                "activation_offloading: hidden_states with reentrant checkpointing "
+                "is incompatible with `unfrozen_parameters` (partially frozen model)."
+            )
+        if self.adapter:
+            LOG.warning(
+                "activation_offloading: hidden_states uses gradient checkpointing; "
+                "with LoRA/QLoRA, activation_offloading: true can be faster because "
+                "it avoids recompute while offloading smaller adapter activations."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_better_transformers(self):
+        if self.flash_optimum is True:
+            if self.adapter:
+                LOG.warning(
+                    "BetterTransformers probably doesn't work with PEFT adapters"
+                )
+            if self.fp16 or self.bf16:
+                raise ValueError("AMP is not supported with BetterTransformer")
+            if self.float16 is not True and self.bfloat16 is not True:
+                LOG.warning(
+                    "You should probably set bfloat16 or float16 to true to "
+                    "load the model in float16 for BetterTransformers"
+                )
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_gptq_w_revision(cls, data):
+        if data.get("gptq") and data.get("revision_of_model"):
+            raise ValueError(
+                "revision_of_model is not supported for GPTQ models. "
+                + "Please download the model from HuggingFace Hub manually for correct branch, "
+                + "point to its path, and remove revision_of_model from the config."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_gpt_oss_fsdp_loading(cls, data):
+        if data.get("model_quantization_config", "") == "Mxfp4Config":
+            fsdp_config = data.get("fsdp_config") or {}
+            if fsdp_config.get("cpu_ram_efficient_loading", False) is True:
+                raise ValueError(
+                    "FSDP cpu_ram_efficient_loading is not supported for Mxfp4Config model quantization."
+                )
+        return data
+
+
+class ComplexValidationMixin:
+    """Complex validation methods that involve multiple systems."""
+
+    @field_validator("neftune_noise_alpha")
+    @classmethod
+    def validate_neftune_noise_alpha(cls, neftune_noise_alpha):
+        if neftune_noise_alpha is not None and neftune_noise_alpha <= 0.0:
+            raise ValueError("neftune_noise_alpha must be > 0.0")
+        return neftune_noise_alpha
+
+    @model_validator(mode="after")
+    def check_rl_beta(self):
+        if self.dpo_beta and not self.rl_beta:
+            self.rl_beta = self.dpo_beta
+            del self.dpo_beta
+        return self
+
+    @model_validator(mode="after")
+    def check_simpo_warmup(self):
+        if self.rl is RLType.SIMPO and self.warmup_ratio:
+            raise ValueError(
+                "warmup_ratio is not supported with the simpo trainer. Please use `warmup_steps` instead"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_relora(self):
+        if self.relora:
+            if not self.jagged_restart_steps:
+                raise ValueError("jagged_restart_steps must be set to use ReLoRA")
+
+            adapter_supports_relora = self.adapter in ("lora", "qlora")
+            if self.adapter and not adapter_supports_relora:
+                from axolotl.integrations.base import PluginManager
+
+                plugin_manager = PluginManager.get_instance()
+                adapter_supports_relora = plugin_manager.adapter_supports_relora(
+                    self.adapter
+                )
+            if not adapter_supports_relora:
+                raise ValueError(
+                    "cfg.adapter must support ReLoRA to use ReLoRA restart semantics"
+                )
+
+            if self.fsdp_config:
+                raise ValueError("fsdp not supported with ReLoRA")
+
+            if self.deepspeed:
+                raise ValueError("deepspeed not supported with ReLoRA")
+
+            if self.lr_scheduler == "one_cycle":
+                raise ValueError(
+                    "ReLoRA is not compatible with the one_cycle scheduler"
+                )
+
+            if self.flash_attn_fuse_mlp:
+                raise ValueError("Fused modules are not supported with ReLoRA")
+        return self
+
+    @model_validator(mode="after")
+    def check_early_stopping(self):
+        if self.early_stopping_patience:
+            if not self.save_steps or not self.eval_steps:
+                raise ValueError(
+                    "`early_stopping_patience` requires save_steps and eval_steps to be set. eval_steps should evenly divide save_steps."
+                )
+            if self.save_steps % self.eval_steps != 0:
+                raise ValueError(
+                    "`early_stopping_patience` requires that eval_steps should evenly divide save_steps."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def check_tensor_parallel_size(self):
+        if not self.tensor_parallel_size:
+            self.tensor_parallel_size = 1
+        return self
+
+    @model_validator(mode="after")
+    def check_context_parallel_size(self):
+        if self.sequence_parallel_degree and not self.context_parallel_size:
+            LOG.warning(
+                "`sequence_parallel_degree` is deprecated, use `context_parallel_size`"
+            )
+            self.context_parallel_size = self.sequence_parallel_degree
+        if not self.context_parallel_size:
+            self.context_parallel_size = 1
+        elif self.context_parallel_size > 1:
+            if (self.sample_packing or self.batch_flattening) and getattr(
+                self, "use_glm_dsa_kernels", False
+            ):
+                raise ValueError(
+                    "GLM DSA context parallelism does not support packed inputs"
+                )
+            if self.attn_implementation == "eager" and not getattr(
+                self, "use_glm_dsa_kernels", False
+            ):
+                raise ValueError(
+                    "context parallelism wraps a kernel-backed attention "
+                    "implementation (sdpa/flash/flex); `attn_implementation: eager` "
+                    "is not supported."
+                )
+            cp_block_size = getattr(
+                getattr(self, "context_parallel", None), "size", None
+            )
+            if (
+                cp_block_size is not None
+                and cp_block_size != self.context_parallel_size
+            ):
+                raise ValueError(
+                    f"context_parallel.size ({cp_block_size}) conflicts with "
+                    f"context_parallel_size ({self.context_parallel_size}); "
+                    "set only one"
+                )
+
+            LOG.warning(
+                "Context parallelism (CP) is enabled with "
+                f"context_parallel_size={self.context_parallel_size}. "
+                "Please note that logged losses may differ slightly to the non-CP "
+                "losses due to transformers Trainer implementation details. "
+                "Please see https://github.com/axolotl-ai-cloud/axolotl/pull/2495#issuecomment-2784022042 "
+                "for more details."
+            )
+
+        return self
+
+    @model_validator(mode="after")
+    def check_context_parallel_deepspeed(self):
+        if not (self.deepspeed and (self.context_parallel_size or 1) > 1):
+            return self
+        if getattr(self, "use_glm_dsa_kernels", False):
+            raise ValueError(
+                "GLM DSA context parallelism needs ringmaster, which does not run under "
+                "DeepSpeed; use FSDP2 instead."
+            )
+        if self.rl:
+            raise ValueError(
+                f"rl: {self.rl} with context_parallel_size > 1 under DeepSpeed is not "
+                "supported: only the SFT trainer weights each Ulysses rank's loss; use FSDP2."
+            )
+        cp = getattr(self, "context_parallel", None)
+        if cp is not None and (
+            getattr(cp, "backend", "auto") not in ("auto", "ulysses")
+            or getattr(cp, "ring_size", None) not in (None, 1)
+            or getattr(cp, "ulysses_size", None) not in (None, cp.size)
+        ):
+            raise ValueError(
+                "Under DeepSpeed, context parallelism maps to DeepSpeed Ulysses (ALST): "
+                "only `context_parallel.backend: ulysses` (or auto) with the full CP "
+                "degree as ulysses_size is supported; Ring/USP need FSDP2."
+            )
+        LOG.info(
+            "DeepSpeed + context_parallel_size=%d: sequences are split with DeepSpeed "
+            "Ulysses (ALST) through accelerate's sequence-parallel axis.",
+            self.context_parallel_size,
+        )
+        return self
+
+    @model_validator(mode="after")
+    def validate_ring_attn_func(self):
+        if self.ring_attn_func is not None or self.heads_k_stride is not None:
+            LOG.warning(
+                "`ring_attn_func` and `heads_k_stride` are deprecated and unused; "
+                "ringmaster context parallelism replaced the ring_flash_attn backend"
+            )
+        return self
+
+    def hint_gradient_checkpointing_dpo_lora_ddp(self):
+        if (
+            (self.gradient_checkpointing is True or self.gradient_checkpointing is None)
+            and self.capabilities
+            and self.capabilities.get("n_gpu", 1) > 1
+            and self.adapter in ("lora", "qlora")
+            and self.rl == RLType.DPO
+            and not self.fsdp_config
+            and not self.deepspeed
+        ):
+            LOG.warning(
+                "gradient_checkpointing with DPO + DDP + LoRA is not recommended."
+            )
+        return self
+
+
+class DistributedValidationMixin:
+    """validation for distributed training."""
+
+    @model_validator(mode="after")
+    def check_tensor_parallel_optimizer(self):
+        if (self.tensor_parallel_size or 1) > 1:
+            if self.optimizer in ["paged_adamw_8bit", "adamw_8bit", "adamw_bnb_8bit"]:
+                raise ValueError(
+                    "tensor_parallel_size is not supported with paged_adamw_8bit, adamw_8bit, and adamw_bnb_8bit optimizers"
+                )
+
+        return self
+
+    @model_validator(mode="after")
+    def check_tensor_parallel_cpu_ram_efficient_loading(self):
+        # transformers' TP load places each rank's own shard, so the rank-0-only load that
+        # cpu_ram_efficient_loading broadcasts from would leave every other rank with zeros
+        # CPU-staged NF4 rejects TP itself and needs the flag intact to reach that check
+        staged_nf4 = self.nf4_backend == "torchao" or (
+            self.qlora_sharded_model_loading and self.load_in_4bit
+        )
+        if (
+            (self.tensor_parallel_size or 1) > 1
+            and not staged_nf4
+            and self.fsdp_config
+            and self.fsdp_config.cpu_ram_efficient_loading
+        ):
+            LOG.warning(
+                "fsdp_config.cpu_ram_efficient_loading is disabled with tensor_parallel_size > 1; "
+                "each rank loads its own tensor-parallel shard directly"
+            )
+            self.fsdp_config.cpu_ram_efficient_loading = False
+        return self
+
+    @model_validator(mode="after")
+    def check_tensor_parallel_expert_parallel(self):
+        if (self.tensor_parallel_size or 1) > 1 and (
+            getattr(self, "expert_parallel_size", 1) or 1
+        ) > 1:
+            raise ValueError(
+                "tensor_parallel_size > 1 cannot be combined with expert_parallel_size > 1; "
+                "shard the experts with expert_parallel_size and the rest with dp_shard_size"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_sharded_adapter_checkpoints(self):
+        if self.adapter_checkpoint_format != "sharded":
+            if self.adapter_final_save_format == "sharded":
+                raise ValueError(
+                    "adapter_final_save_format: sharded requires "
+                    "adapter_checkpoint_format: sharded"
+                )
+            return self
+        problems = []
+        if not self.adapter:
+            problems.append("an adapter (lora/qlora)")
+        if not self.fsdp_config or (self.fsdp_version or 2) != 2:
+            problems.append("fsdp_version: 2")
+        elif self.fsdp_config.state_dict_type != "FULL_STATE_DICT":
+            problems.append("fsdp_config.state_dict_type: FULL_STATE_DICT")
+        if (self.tensor_parallel_size or 1) > 1:
+            problems.append("tensor_parallel_size: 1")
+        if self.rl:
+            # the RL trainers do not include ShardedAdapterSaveMixin
+            problems.append("rl unset")
+        if self.load_best_model_at_end:
+            # the best checkpoint may still be consolidating when training ends
+            problems.append("load_best_model_at_end: false")
+        if self.hub_model_id and (self.hub_strategy or "every_save") != "end":
+            # Trainer pushes each checkpoint before its adapter is consolidated
+            problems.append("hub_strategy: end when hub_model_id is set")
+        if problems:
+            raise ValueError(
+                "adapter_checkpoint_format: sharded writes PEFT adapter-only checkpoints "
+                "under FSDP2 and requires " + ", ".join(problems)
+            )
+        return self
+
+
+class EBFTValidationMixin:
+    """Validation for EBFT (Energy-Based Fine-Tuning) configuration."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_ebft_config_required(cls, data):
+        """rl: ebft requires an ebft config section."""
+        if data.get("rl") == "ebft" and not data.get("ebft"):
+            raise ValueError(
+                "`ebft` config section is required when `rl: ebft` is set. "
+                "Add an `ebft:` section with at least `mode: structured` or `mode: strided`."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_ebft_torch_compile(cls, data):
+        """torch_compile + flex_attention + gradient_checkpointing causes dynamo recompiles
+        and CheckpointErrors. The flex_attention kernel compiles itself internally —
+        whole-model torch.compile is not needed and actively harmful."""
+        if (
+            data.get("rl") == "ebft"
+            and data.get("torch_compile") is True
+            and (data.get("ebft") or {}).get("mode") == "strided"
+        ):
+            if data.get("gradient_checkpointing"):
+                raise ValueError(
+                    "EBFT strided mode: `torch_compile: true` with `gradient_checkpointing: true` "
+                    "causes CheckpointError (BlockMask metadata mismatch during recomputation). "
+                    "Remove `torch_compile` — the flex_attention kernel compiles itself internally."
+                )
+            LOG.warning(
+                "EBFT strided mode: `torch_compile: true` causes dynamo recompiles from "
+                "variable sequence lengths across steps. Consider removing it — "
+                "flex_attention compiles itself internally."
+            )
+        return data
+
+    @model_validator(mode="after")
+    def check_ebft_gradient_checkpointing_reentrant(self):
+        """flex_attention + non-reentrant gradient checkpointing causes CheckpointError."""
+        if (
+            self.rl == "ebft"
+            and self.ebft is not None
+            and self.ebft.mode == "strided"
+            and self.attn_implementation == "flex_attention"
+            and self.gradient_checkpointing
+        ):
+            gc_kwargs = self.gradient_checkpointing_kwargs or {}
+            if not gc_kwargs.get("use_reentrant"):
+                LOG.warning(
+                    "EBFT strided mode with flex_attention: setting `use_reentrant: true` in "
+                    "gradient_checkpointing_kwargs (required for flex_attention compatibility). "
+                    "Non-reentrant checkpointing causes CheckpointError with BlockMask metadata."
+                )
+                if self.gradient_checkpointing_kwargs is None:
+                    self.gradient_checkpointing_kwargs = {}
+                self.gradient_checkpointing_kwargs["use_reentrant"] = True
+        return self
+
+    @model_validator(mode="after")
+    def check_ebft_activation_offloading(self):
+        """activation_offloading replaces gradient checkpointing with FSDP-style wrapping,
+        which conflicts with flex_attention's use_reentrant requirement."""
+        if (
+            self.rl == "ebft"
+            and self.ebft is not None
+            and self.ebft.mode == "strided"
+            and self.activation_offloading is True
+            and self.attn_implementation == "flex_attention"
+        ):
+            raise ValueError(
+                "EBFT strided mode: `activation_offloading: true` is incompatible with "
+                "`attn_implementation: flex_attention`. Activation offloading replaces "
+                "gradient checkpointing with FSDP-style wrapping that conflicts with "
+                "flex_attention's reentrant checkpoint requirement. Remove "
+                "`activation_offloading` — the strided trainer uses micro-batched forward "
+                "passes for memory efficiency instead."
+            )
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_ebft_strided_sequence_len(cls, data):
+        """Warn if sequence_len is too large for single-GPU strided EBFT."""
+        ebft = data.get("ebft") or {}
+        if data.get("rl") != "ebft" or ebft.get("mode") != "strided":
+            return data
+        seq_len = data.get("sequence_len", 512)
+        n_samples = ebft.get("n_samples_per_prompt", 4)
+        gen_len = ebft.get("generate_max_len", 8)
+        stride = ebft.get("stride", 8)
+        ctx_len = ebft.get("context_length", 8)
+        max_blocks = (seq_len - gen_len - ctx_len) // stride + 1
+        full_seq = seq_len + max_blocks * gen_len
+        # Rough estimate: 8.7 GB per sample at S=3900 for 1B model
+        if full_seq * n_samples > 20000:
+            LOG.warning(
+                f"EBFT strided: full_seq_len={full_seq} * n_samples={n_samples} = "
+                f"{full_seq * n_samples} token-samples per step. This may require >24GB VRAM "
+                f"for a 1B+ model. Consider reducing sequence_len, n_samples_per_prompt, or stride."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_ebft_strided_dataset_split(cls, data):
+        """Warn about the common `train_on_split` mistake (silently ignored by schema)."""
+        datasets = data.get("datasets", [])
+        for ds in datasets or []:
+            if isinstance(ds, dict) and ds.get("train_on_split"):
+                LOG.warning(
+                    f"Dataset has `train_on_split: {ds['train_on_split']}` — this field "
+                    f"is not recognized and will be silently ignored. "
+                    f"Use `split: {ds['train_on_split']}` instead."
+                )
+        return data
+
+
+class GRPOVllmValidationMixin:
+    """Validation mixin for vllm when using GRPO."""
+
+    @model_validator(mode="after")
+    def check_vllm_mode_set(self):
+        if self.trl and self.trl.use_vllm and not self.trl.vllm_mode:
+            LOG.warning(
+                "vllm_mode must be set to either `server` or `colocate` when using vllm, using default value `server`"
+            )
+            self.trl.vllm_mode = "server"
+        return self
+
+    @model_validator(mode="after")
+    def check_vllm_colocate_compat(self):
+        trl = self.trl
+        if not (trl and trl.use_vllm and trl.vllm_mode == "colocate"):
+            return self
+        if (self.context_parallel_size or 1) > 1:
+            raise ValueError(
+                "`vllm_mode: colocate` is not supported with `context_parallel_size > 1`. "
+                "Use `vllm_mode: server` with a dedicated vLLM GPU."
+            )
+        if trl.vllm_lora_sync:
+            raise ValueError(
+                "`vllm_lora_sync: true` requires `vllm_mode: server` (adapters are pushed "
+                "over HTTP to the vLLM server). In colocate mode, remove `vllm_lora_sync`; "
+                "weights are merged and loaded into the colocated engine directly."
+            )
+        if (trl.async_prefetch or trl.use_data_producer) and self.adapter:
+            raise ValueError(
+                "`vllm_mode: colocate` with an adapter is not supported by the async GRPO "
+                "trainer (`async_prefetch` / `use_data_producer`): its LoRA weight sync only "
+                "targets a vLLM server. Remove those options or use `vllm_mode: server`."
+            )
+        if not (self.vllm and self.vllm.max_model_len):
+            LOG.warning(
+                "Set `vllm.max_model_len` (longest prompt + max_completion_length) for "
+                "`vllm_mode: colocate`; otherwise vLLM reserves KV cache for the model's "
+                "full context and may fail to start on the shared GPU."
+            )
+        return self
+
+
+class ValidationMixin(
+    DatasetValidationMixin,
+    AttentionValidationMixin,
+    TrainingValidationMixin,
+    LoRAValidationMixin,
+    RLValidationMixin,
+    OptimizationValidationMixin,
+    SystemValidationMixin,
+    ChatTemplateValidationMixin,
+    PretrainingValidationMixin,
+    ModelCompatibilityValidationMixin,
+    ComplexValidationMixin,
+    DistributedValidationMixin,
+    EBFTValidationMixin,
+    GRPOVllmValidationMixin,
+):
+    """Full validation mixin for Axolotl configuration."""

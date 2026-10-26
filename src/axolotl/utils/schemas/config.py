@@ -1,0 +1,2326 @@
+"""Module with Pydantic models for configuration."""
+
+import re
+from typing import Annotated, Any, Literal
+
+from accelerate.utils import is_fp8_available
+from annotated_types import MinLen
+from packaging import version
+from pydantic import (
+    BaseModel,
+    Field,
+    StringConstraints,
+    computed_field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+
+from axolotl.utils.datasets import get_default_process_count
+from axolotl.utils.logging import get_logger
+from axolotl.utils.schemas.checkpoint_mirror import CheckpointMirrorConfig
+from axolotl.utils.schemas.checkpoint_save_retry import CheckpointSaveRetryConfig
+from axolotl.utils.schemas.datasets import (
+    DatasetConfig,
+    DPODataset,
+    KTODataset,
+    PretrainingDataset,
+    SFTDataset,
+    StepwiseSupervisedDataset,
+    SyntheticDataset,
+)
+from axolotl.utils.schemas.deprecated import DeprecatedParameters, RemappedParameters
+from axolotl.utils.schemas.diffusion import DiffusionLMConfig
+from axolotl.utils.schemas.dynamic_checkpoint import DynamicCheckpointConfig
+from axolotl.utils.schemas.enums import (
+    ATTN_IMPLS_SUPPORTING_PACKING,
+    ATTN_IMPLS_USING_FLASH_LIB,
+    ATTN_IMPLS_WITHOUT_DTYPE_CAST,
+    CANONICAL_ATTN_IMPLS,
+    INDUCTOR_COMPILE_OPTIONS_ALLOWLIST,
+    LEGACY_ATTN_FLAG_TO_IMPL,
+    SHORT_FORM_ALIAS_TO_CANONICAL,
+    ChatTemplate,
+    RingAttnFunc,
+    RLType,
+    attn_impl_base,
+)
+from axolotl.utils.schemas.export import ExportConfig
+from axolotl.utils.schemas.fp8 import FP8Config
+from axolotl.utils.schemas.fsdp import FSDPConfig
+from axolotl.utils.schemas.integrations import (
+    CometConfig,
+    GradioConfig,
+    LISAConfig,
+    MLFlowConfig,
+    OpenTelemetryConfig,
+    RayConfig,
+    TrackioConfig,
+    WandbConfig,
+)
+from axolotl.utils.schemas.internal import EnvCapabilities, GPUCapabilities
+from axolotl.utils.schemas.model import (
+    ModelInputConfig,
+    ModelOutputConfig,
+    SpecialTokensConfig,
+)
+from axolotl.utils.schemas.multimodal import MultiModalConfig
+from axolotl.utils.schemas.peft import LoraConfig, MixLoraConfig, ReLoRAConfig
+from axolotl.utils.schemas.quantization import PTQConfig, QATConfig
+from axolotl.utils.schemas.training import (
+    HyperparametersConfig,
+    JaggedLRConfig,
+    SelectiveCheckpointingConfig,
+)
+from axolotl.utils.schemas.trl import TRLConfig
+from axolotl.utils.schemas.validation import (
+    ValidationMixin,
+    lora_kernels_auto_enable,
+)
+from axolotl.utils.schemas.vllm import VllmConfig
+
+LOG = get_logger(__name__)
+
+
+class EBFTConfig(BaseModel):
+    """Configuration for Energy-Based Fine-Tuning (EBFT)"""
+
+    feature_layers: list[float] = Field(
+        default=[0.25, 0.5, 0.75],
+        json_schema_extra={
+            "description": "Fractional layer depths for feature extraction (e.g., [0.25, 0.5, 0.75])"
+        },
+    )
+    embed_method: Literal["last_token", "mean_pooling", "completion_mean", "concat"] = (
+        Field(
+            default="last_token",
+            json_schema_extra={
+                "description": "Embedding method: 'last_token', 'mean_pooling', 'completion_mean', or 'concat'"
+            },
+        )
+    )
+    use_whitening: bool = Field(
+        default=False,
+        json_schema_extra={"description": "Apply SVD whitening to feature embeddings"},
+    )
+    alignment_coef: float = Field(
+        default=1.0,
+        json_schema_extra={
+            "description": "Coefficient for alignment reward (cosine similarity with ground truth)"
+        },
+    )
+    diversity_coef: float = Field(
+        default=1.0,
+        json_schema_extra={
+            "description": "Coefficient for diversity penalty (pairwise similarity between samples)"
+        },
+    )
+    ce_coef: float = Field(
+        default=0.0,
+        json_schema_extra={
+            "description": "Cross-entropy loss coefficient on ground-truth tokens"
+        },
+    )
+    adaptive_max_tokens: bool = Field(
+        default=True,
+        json_schema_extra={
+            "description": "Set per-batch max_tokens based on ground-truth length"
+        },
+    )
+    gt_length_multiplier: float = Field(
+        default=1.5,
+        ge=0.1,
+        json_schema_extra={
+            "description": "Multiplier for ground-truth token count when computing adaptive max_tokens"
+        },
+    )
+
+    # Strided mode fields (for unstructured text)
+    mode: Literal["structured", "strided"] = Field(
+        default="structured",
+        json_schema_extra={
+            "description": "EBFT mode: 'structured' (QA with vLLM) or 'strided' (unstructured text)"
+        },
+    )
+    stride: int = Field(
+        default=8,
+        ge=1,
+        json_schema_extra={"description": "Stride between anchor points (tokens)"},
+    )
+    context_length: int = Field(
+        default=8,
+        ge=1,
+        json_schema_extra={"description": "Context window size per block"},
+    )
+    generate_max_len: int = Field(
+        default=8,
+        ge=1,
+        json_schema_extra={"description": "Tokens to generate per block"},
+    )
+    n_samples_per_prompt: int = Field(
+        default=4,
+        ge=1,
+        json_schema_extra={"description": "Independent rollouts per document"},
+    )
+    temperature: float = Field(
+        default=0.6,
+        ge=0.0,
+        json_schema_extra={
+            "description": "Sampling temperature for strided generation"
+        },
+    )
+    top_p: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        json_schema_extra={"description": "Top-p nucleus sampling threshold"},
+    )
+    rl_coef: float = Field(
+        default=1.0,
+        json_schema_extra={"description": "RL policy gradient loss coefficient"},
+    )
+    advantage_estimator: Literal["rloo", "group_norm", "reinforce"] = Field(
+        default="rloo",
+        json_schema_extra={
+            "description": "Advantage estimator: 'rloo', 'group_norm', 'reinforce'"
+        },
+    )
+    min_completion_prefix: int = Field(
+        default=0,
+        ge=0,
+        json_schema_extra={
+            "description": "Minimum tokens into completion before placing anchors. "
+            "Skips anchors too close to the prompt boundary where features are dominated by prompt context."
+        },
+    )
+
+
+class AxolotlInputConfig(
+    ModelInputConfig,
+    ModelOutputConfig,
+    LoraConfig,
+    MixLoraConfig,
+    ReLoRAConfig,
+    JaggedLRConfig,
+    HyperparametersConfig,
+    WandbConfig,
+    MLFlowConfig,
+    CometConfig,
+    TrackioConfig,
+    OpenTelemetryConfig,
+    LISAConfig,
+    GradioConfig,
+    RayConfig,
+    MultiModalConfig,
+    RemappedParameters,
+    DeprecatedParameters,
+    ValidationMixin,
+    BaseModel,
+):
+    """Wrapper of all config options."""
+
+    model_config = {"populate_by_name": True}
+
+    diffusion_lm: DiffusionLMConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Canonical configuration for diffusion language-model training"
+        },
+    )
+
+    strict: bool | None = Field(
+        default=False,
+        json_schema_extra={"description": "Allow overwrite yml config using from cli"},
+    )
+    resume_from_checkpoint: str | None = Field(
+        default=None,
+        json_schema_extra={"description": "Resume from a specific checkpoint dir"},
+    )
+    auto_resume_from_checkpoints: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "If resume_from_checkpoint isn't set and you simply want it to start where it left off. Be careful with this being turned on between different models."
+        },
+    )
+    resize_token_embeddings_to_32x: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Resize the model embeddings when new tokens are added to multiples of 32. This is reported to improve training speed on some models"
+        },
+    )
+    mean_resizing_embeddings: bool | None = False
+    # optionally shrink the embeddings when the tokenizer vocab size is smaller
+    shrink_embeddings: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to shrink the embeddings to len(tokenizer). By default, we won't shrink."
+        },
+    )
+    embeddings_skip_upcast: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Don't upcast the embeddings to float32 when using PEFT. Useful for low-VRAM GPUs"
+        },
+    )
+    reinit_weights: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Reinitialize model weights randomly instead of loading pretrained weights"
+        },
+    )
+
+    trainer_cls: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "module to custom trainer class to use for training"
+        },
+    )
+
+    rl: RLType | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Use RL training: 'dpo', 'ipo', 'kto', 'simpo', 'orpo', 'grpo', 'ebft'"
+        },
+    )
+    trl: TRLConfig | None = Field(
+        default_factory=lambda: TRLConfig(),
+    )
+    vllm: VllmConfig | None = Field(
+        default_factory=lambda: VllmConfig(),
+    )
+    ebft: EBFTConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Configuration for Energy-Based Fine-Tuning (EBFT)"
+        },
+    )
+    qat: QATConfig | None = None
+    quantization: PTQConfig | None = None
+    export: ExportConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Configuration for `axolotl export` (GGUF conversion)"
+        },
+    )
+    reward_model: bool | None = Field(
+        default=None,
+        json_schema_extra={"description": "Reward modelling: `True` or `False`"},
+    )
+    dynamic_checkpoint: DynamicCheckpointConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Configuration for dynamic checkpointing (trigger by file). "
+            "Set 'enabled: true' to activate this feature."
+        },
+    )
+    process_reward_model: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Process reward modelling: `True` or `False`"
+        },
+    )
+    center_rewards_coefficient: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Coefficient to incentivize the reward model to output mean-zero rewards (proposed by https://huggingface.co/papers/2312.09244, Eq. 2). Recommended value: `0.01`."
+        },
+    )
+    num_labels: int | None = None
+    # Whether to use weighting in DPO trainer.
+    # If `None`, default is `False` in the trainer.
+    dpo_use_weighting: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to perform weighting in DPO trainer"
+        },
+    )
+    dpo_label_smoothing: float | None = None
+    dpo_ld_alpha: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        json_schema_extra={
+            "description": "LD-DPO length desensitization: weight on the log-probabilities of the tokens a "
+            "response has beyond the shorter response of its pair (1.0 = unweighted, 0.0 = ignore them). "
+            "Applies to every DPO loss type, including apo_zero."
+        },
+    )
+    precompute_ref_log_probs: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Precompute reference model log probabilities for DPO"
+        },
+    )
+
+    dpo_use_liger_kernel: bool | None = Field(
+        default=None,
+        json_schema_extra={"description": "Whether to use Liger kernel for DPO loss."},
+    )
+
+    dpo_padding_free: bool | None = None
+
+    dpo_loss_type: Annotated[list[str], MinLen(1)] | None = Field(
+        default=None,
+        json_schema_extra={"description": "List of DPO losses to use."},
+    )
+
+    dpo_loss_weights: Annotated[list[float], MinLen(1)] | None = Field(
+        default=None,
+        json_schema_extra={"description": "Weights for each DPO loss."},
+    )
+
+    datasets: (
+        Annotated[
+            list[
+                SFTDataset
+                | DPODataset
+                | KTODataset
+                | StepwiseSupervisedDataset
+                | SyntheticDataset
+            ],
+            MinLen(1),
+        ]
+        | None
+    ) = Field(
+        default=None,
+        json_schema_extra={
+            "description": "A list of one or more datasets to finetune the model with"
+        },
+    )
+
+    test_datasets: (
+        Annotated[
+            list[
+                SFTDataset
+                | DPODataset
+                | KTODataset
+                | StepwiseSupervisedDataset
+                | SyntheticDataset
+            ],
+            MinLen(1),
+        ]
+        | None
+    ) = Field(
+        default=None,
+        json_schema_extra={
+            "description": "A list of one or more datasets to eval the model with. You can use either test_datasets, or val_set_size, but not both."
+        },
+    )
+    shuffle_merged_datasets: bool | None = Field(
+        default=True,
+        json_schema_extra={
+            "description": "If false, the datasets will not be shuffled and will keep their original order in `datasets`. The same applies to the `test_datasets` option and the `pretraining_dataset` option. Default is true."
+        },
+    )
+    shuffle_before_merging_datasets: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "If true, each dataset in `datasets` will be shuffled before merging. This allows curriculum learning strategies to be applied at the dataset level. Default is false."
+        },
+    )
+    dataset_prepared_path: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Axolotl attempts to save the dataset as an arrow after packing the data together so subsequent training attempts load faster, relative path"
+        },
+    )
+    dataset_shard_num: int | None = Field(
+        default=None, json_schema_extra={"description": "Num shards for whole dataset"}
+    )
+    dataset_shard_idx: int | None = Field(
+        default=None,
+        json_schema_extra={"description": "Index of shard to use for whole dataset"},
+    )
+    skip_prepare_dataset: bool | None = False
+    num_dataset_shards_to_save: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of shards to save the prepared dataset"
+        },
+    )
+
+    pretraining_dataset: (
+        Annotated[list[PretrainingDataset | SFTDataset], MinLen(1)] | None
+    ) = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Set to HF dataset for type: 'completion' for streaming instead of pre-tokenize"
+        },
+    )
+    dataset_processes: int | None = Field(
+        default=None,
+        deprecated="Use `dataset_num_proc` instead. This parameter will be removed in a future version.",
+        json_schema_extra={
+            "description": (
+                "The maximum number of processes to use while preprocessing your input dataset. This defaults to `os.cpu_count()` if not set.\n"
+                "For Runpod VMs, it will default to number of vCPUs via RUNPOD_CPU_COUNT."
+            )
+        },
+    )
+    dataset_num_proc: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "The maximum number of processes to use while preprocessing your input dataset. This defaults to `os.cpu_count()` if not set.\n"
+                "For Runpod VMs, it will default to number of vCPUs via RUNPOD_CPU_COUNT."
+            )
+        },
+    )
+
+    dataset_exact_deduplication: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Deduplicates datasets and test_datasets with identical entries"
+        },
+    )
+    dataset_keep_in_memory: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Keep dataset in memory while preprocessing. Only needed if cached dataset is taking too much storage"
+        },
+    )
+    dataloader_pin_memory: bool | None = None
+    dataloader_num_workers: int | None = None
+    dataloader_prefetch_factor: int | None = None
+    dataloader_drop_last: bool | None = None
+
+    accelerator_config: dict[str, Any] | None = None
+
+    remove_unused_columns: bool | None = None
+
+    push_dataset_to_hub: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Push prepared dataset to hub - repo_org/repo_name"
+        },
+    )
+    hf_use_auth_token: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to use hf `use_auth_token` for loading datasets. Useful for fetching private datasets. Required to be true when used in combination with `push_dataset_to_hub`"
+        },
+    )
+
+    device: Any | None = None
+    device_map: Any | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Passed through to transformers when loading the model when launched without accelerate. Use `sequential` when training w/ model parallelism to limit memory"
+        },
+    )
+    world_size: int | None = None
+    local_rank: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Don't mess with this, it's here for accelerate and torchrun"
+        },
+    )
+    ddp: bool | None = None
+
+    seed: int | None = Field(
+        default=None, json_schema_extra={"description": "Seed for reproducibility"}
+    )
+    full_determinism: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Seed with transformers' enable_full_determinism (deterministic torch algorithms and CUBLAS workspace config) instead of set_seed. Slower."
+        },
+    )
+    ddp_timeout: int | None = Field(
+        default=None,
+        json_schema_extra={"description": "Advanced DDP Arguments - timeout"},
+    )
+    ddp_bucket_cap_mb: int | None = Field(
+        default=None,
+        json_schema_extra={"description": "Advanced DDP Arguments - bucket cap in MB"},
+    )
+    ddp_broadcast_buffers: bool | None = Field(
+        default=None,
+        json_schema_extra={"description": "Advanced DDP Arguments - broadcast buffers"},
+    )
+    ddp_find_unused_parameters: bool | None = None
+
+    do_causal_lm_eval: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to run causal language model evaluation for metrics in `eval_causal_lm_metrics`"
+        },
+    )
+    eval_causal_lm_metrics: list[str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "HF evaluate metrics used during evaluation. Default is ['sacrebleu', 'comet', 'ter', 'chrf', 'perplexity']"
+        },
+    )
+    do_bench_eval: bool | None = None
+    bench_dataset: str | None = None
+    bench_split: str | None = None
+    metric_for_best_model: str | None = None
+    greater_is_better: bool | None = None
+
+    loss_watchdog_threshold: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "High loss value, indicating the learning has broken down (a good estimate is ~2 times the loss at the start of training)"
+        },
+    )
+    loss_watchdog_patience: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of high-loss steps in a row before the trainer aborts (default: 3)"
+        },
+    )
+
+    gc_steps: int | None = Field(
+        default=None,
+        deprecated=(
+            "Use `torch_empty_cache_steps` to control CUDA cache clearing and "
+            "`gc_collect_steps` for Python garbage collection. "
+            "`gc_steps` will be removed in a future version."
+        ),
+        json_schema_extra={
+            "description": "Deprecated. Run garbage collection every `gc_steps` steps. Use `torch_empty_cache_steps` and `gc_collect_steps` instead."
+        },
+    )
+    torch_empty_cache_steps: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Steps between native HF Trainer `torch.cuda.empty_cache()` calls."
+        },
+    )
+    gc_collect_steps: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Steps between Python `gc.collect()` calls. -1 runs on epoch end and before evals only; None disables."
+        },
+    )
+
+    bf16: Literal["auto"] | bool | None = Field(
+        default="auto",
+        json_schema_extra={
+            "description": "Use CUDA bf16. bool or 'full' for `bf16_full_eval`, or 'auto' for automatic detection. require >=ampere"
+        },
+    )
+    fp16: bool | None = Field(
+        default=None, json_schema_extra={"description": "Use CUDA fp16"}
+    )
+    fp8: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Enable FP8 mixed precision training using TorchAO. Best "
+            "used in combination with torch.compile."
+        },
+    )
+    fp8_config: FP8Config | None = Field(
+        default=None,
+        json_schema_extra={"description": "FP8 mixed-precision configuration options"},
+    )
+    fp8_enable_fsdp_float8_all_gather: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Enable FSDP float8 all-gather optimization for FP8 training. Can "
+            "improve training speed by 10-15% when FSDP is enabled."
+        },
+    )
+    bfloat16: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "No AMP (automatic mixed precision) - require >=ampere"
+        },
+    )  # for non-AMP cases
+    float16: bool | None = Field(
+        default=None,
+        json_schema_extra={"description": "No AMP (automatic mixed precision)"},
+    )  # for non-AMP cases
+    tf32: Literal["auto"] | bool | None = Field(
+        default="auto",
+        json_schema_extra={
+            "description": "bool to use CUDA tf32 or 'auto' for automatic detection - require >=ampere"
+        },
+    )
+    float32: bool | None = None
+
+    gradient_checkpointing: Literal["offload", "offload_disk"] | bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Whether to use gradient checkpointing. Available options are: true, false, 'offload', 'offload_disk'. https://huggingface.co/docs/transformers/v4.18.0/en/performance#gradient-checkpointing"
+        },
+    )
+    gradient_checkpointing_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Additional kwargs to pass to the trainer for gradient checkpointing"
+        },
+    )
+    selective_checkpointing: SelectiveCheckpointingConfig | bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Selective activation checkpointing: within each gradient-checkpointed "
+                "layer, save the listed ops during forward instead of recomputing them "
+                "in backward. `true` saves attention (SDPA/flash-attention). Requires "
+                "gradient_checkpointing with non-reentrant checkpointing."
+            )
+        },
+    )
+    activation_offloading: Literal["legacy", "disk", "hidden_states"] | bool | None = (
+        Field(
+            default=False,
+            json_schema_extra={
+                "description": (
+                    "Whether to offload activations. Options: true/false, 'legacy', "
+                    "'disk' (TRL offloader), or 'hidden_states' (checkpoint input "
+                    "offload; non-reentrant by default, ALST-style when "
+                    "gradient_checkpointing_kwargs.use_reentrant is true)."
+                )
+            },
+        )
+    )
+    layer_offloading: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Offload model layer parameters to CPU during forward, prefetch back during backward."
+        },
+    )
+
+    freeze_mm_modules: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Freeze multimodal encoder parameters (vision, audio, etc.) for "
+            "text-only training of multimodal models. When True, parameters belonging to "
+            "vision towers, audio towers, multimodal projectors, and similar non-language "
+            "modules are frozen (requires_grad=False). This allows DDP training without "
+            "ddp_find_unused_parameters=True."
+        },
+    )
+
+    unfrozen_parameters: list[str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "List of regex patterns for parameter names to keep unfrozen. "
+            "All other parameters will be frozen via requires_grad=False. "
+            "Note: range-based patterns (e.g. embed_tokens.weight$[:32000]) use gradient "
+            "zeroing rather than a true freeze, so weight decay will still apply to the "
+            "frozen portion and optimizer states are allocated for the full parameter."
+        },
+    )
+
+    sequence_len: int = Field(
+        default=512,
+        json_schema_extra={
+            "description": "The maximum length of an input to train with, this should typically be less than 2048 as most models have a token/context limit of 2048"
+        },
+    )
+    excess_length_strategy: Literal["drop", "truncate", "raise"] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "What to do when a tokenized row exceeds sequence_len. 'drop' removes the row; 'truncate' slices tensors to sequence_len; 'raise' raises a ValueError. Defaults to 'drop' for backward compatibility."
+        },
+    )
+    eval_sequence_len: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "The maximum length of an input for evaluation. If not specified, defaults to sequence_len"
+        },
+    )
+    min_sample_len: int | None = None
+    max_prompt_len: int | None = Field(
+        default=None,
+        json_schema_extra={"description": "maximum prompt length for RL training"},
+    )
+    sample_packing: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Use efficient multi-packing with block diagonal attention and per sequence position_ids. Recommend set to 'true'"
+        },
+    )
+    balance_labels: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Balance supervised tokens across causal LM packed, flattened, or padded batches. Supports streaming with sample packing."
+        },
+    )
+    label_balance_window_optim_steps: int = Field(
+        default=1,
+        ge=1,
+        strict=True,
+        json_schema_extra={
+            "description": "Optimizer steps per cross-step label-balancing refinement window for non-streaming training. Requires balance_labels. Defaults to within-step refinement only."
+        },
+    )
+    label_keep_prob: dict[int, float] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Advanced: {token_id: keep_prob}. Each trained label equal to a listed token id is kept with probability keep_prob and otherwise masked to -100, re-drawn independently per position every optimizer step (inputs unchanged; eval is not masked). Ids must be exactly what the chat template emits; find them with `axolotl preprocess --debug` or tokenizer.convert_tokens_to_ids."
+        },
+    )
+    label_keep_prob_normalize: Literal["dropped", "original"] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Loss normalization with label_keep_prob. 'dropped' (default) divides by the trained-token count after masking, like ordinary label masking. 'original' divides by the count before masking, so each other token's weight is unchanged."
+        },
+    )
+    sample_packing_group_size: int | None = Field(
+        default=100_000,
+        json_schema_extra={
+            "description": "The number of samples packed at a time. Increasing the following values helps with packing, but usually only slightly (<%1.)"
+        },
+    )
+    sample_packing_bin_size: int | None = Field(
+        default=200,
+        json_schema_extra={
+            "description": "The number of samples which can be packed into one sequence. Increase if using a large sequence_len with many short samples."
+        },
+    )
+    sample_packing_sequentially: bool | None = Field(
+        default=None,
+        json_schema_extra={"description": "Whether to pack samples sequentially"},
+    )
+    sample_packing_mp_start_method: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "The multiprocessing start method to use for packing. Should be 'fork', 'spawn' or 'forkserver'"
+        },
+    )
+    eval_sample_packing: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Set to 'false' if getting errors during eval with sample_packing on"
+        },
+    )
+    fa_varlen_kwargs_in_collator: bool | None = Field(
+        default=True,
+        json_schema_extra={
+            "description": "With sample_packing and flash attention, precompute the varlen metadata (cu_seq_lens, max_length) once per batch in the collator instead of letting transformers derive it in every attention layer, which costs several host-device syncs per layer. Not used when batches are dispatched (streaming or pretraining datasets unless accelerator_config.dispatch_batches is false) or under DeepSpeed sequence parallel, since both slice every batch tensor per rank. Set to 'false' to restore the per-layer derivation."
+        },
+    )
+    pad_to_sequence_len: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Pad inputs so each step uses constant sized buffers. This will reduce memory fragmentation and may prevent OOMs, by re-using memory more efficiently. Defaults to True if `sample_packing` enabled"
+        },
+    )
+    pad_to_multiple_of: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": ("Pad each batch to a multiple of this value.")
+        },
+    )
+    curriculum_sampling: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to use sequential sampling for curriculum learning"
+        },
+    )
+    multipack_real_batches: bool | None = None
+
+    batch_flattening: Literal["auto"] | bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Use batch flattening for speedups when not using sample_packing"
+        },
+    )
+
+    # for PoSE context length extension
+    use_pose: bool | None = None
+    pose_split_on_token_ids: list[int] | None = None
+    pose_max_context_len: int | None = None
+    pose_num_chunks: int | None = None
+
+    # Deprecated: Use streaming_multipack_buffer_size instead
+    pretrain_multipack_buffer_size: int | None = Field(
+        default=None,
+        deprecated="Deprecated in v0.13.0, will be removed in v0.14.0. Use streaming_multipack_buffer_size instead",
+    )
+    pretrain_multipack_attn: bool | None = Field(
+        default=True,
+        json_schema_extra={
+            "description": "whether to prevent cross attention for packed sequences during pretraining",
+        },
+    )
+    pretraining_sample_concatenation: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "whether to concatenate samples during pretraining",
+        },
+    )
+
+    streaming: bool | None = Field(
+        default=None,
+        json_schema_extra={"description": "Use streaming mode for loading datasets"},
+    )
+    streaming_multipack_buffer_size: int | None = Field(
+        default=10_000,
+        json_schema_extra={
+            "description": "Buffer size for multipack streaming datasets"
+        },
+    )
+
+    xformers_attention: bool | None = Field(
+        default=None,
+        deprecated="Use `attn_implementation: xformers` instead.",
+        json_schema_extra={
+            "description": "[DEPRECATED] Use `attn_implementation: xformers`. https://github.com/facebookresearch/xformers"
+        },
+    )
+    sdp_attention: bool | None = Field(
+        default=None,
+        deprecated="Use `attn_implementation: sdpa` instead.",
+        json_schema_extra={
+            "description": "[DEPRECATED] Use `attn_implementation: sdpa`."
+        },
+    )
+    flex_attention: bool | None = Field(
+        default=None,
+        deprecated="Use `attn_implementation: flex_attention` instead.",
+    )
+    flex_attn_compile_kwargs: dict[str, Any] | None = None
+    flash_attention: bool | None = Field(
+        default=None,
+        deprecated="Use `attn_implementation: flash_attention_2` instead.",
+        json_schema_extra={
+            "description": "[DEPRECATED] Use `attn_implementation: flash_attention_2`. https://github.com/Dao-AILab/flash-attention"
+        },
+    )
+    flash_attn_cross_entropy: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to use flash-attention cross entropy implementation - advanced use only"
+        },
+    )
+    flash_attn_fuse_mlp: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to fuse part of the MLP into a single operation"
+        },
+    )
+    flash_optimum: bool | None = Field(
+        default=None,
+        json_schema_extra={"description": "Whether to use bettertransformers"},
+    )
+    sage_attention: bool | None = Field(
+        default=None,
+        deprecated="Use `attn_implementation: sage` instead.",
+        json_schema_extra={
+            "description": "[DEPRECATED] Use `attn_implementation: sage`. https://github.com/thu-ml/SageAttention"
+        },
+    )
+
+    eager_attention: bool | None = Field(
+        default=None,
+        deprecated="Use `attn_implementation: eager` instead.",
+    )
+
+    attn_implementation: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Attention backend. Canonical values: eager, sdpa, flash_attention_2, "
+                "flash_attention_3, flash_attention_4, flash_attention_torch, "
+                "flex_attention, varlen, xformers, sage, fp8. `varlen` is native "
+                "full-sequence diffusion only. Hub-kernel paths (e.g. "
+                "kernels-community/flash-attn3) are also accepted and passed through to "
+                "transformers."
+            )
+        },
+    )
+
+    gemma4_hybrid_attn_impl: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Use hybrid attention for Gemma 4: flash_attention_2 for sliding window layers "
+            "and sdpa for global (full_attention) layers. Global layers have head_dim=512 which "
+            "exceeds flash attention's supported size."
+        },
+    )
+
+    large_head_attention: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Generic capability for attention layers with head_dim > 256 (which flash/cuDNN "
+                "SDPA can't serve): 'sdpa' (stock SDPA, default) | 'auto' (Triton flash kernel on "
+                "packed rows, SDPA otherwise) | 'triton_flash' (prefer the Triton kernel). Applies "
+                "to any SDPA model; Gemma-4's head_dim=512 global layers use it automatically."
+            )
+        },
+    )
+    # Deprecated alias for `large_head_attention` (True -> 'auto'); kept for backwards compatibility.
+    flash_attn_d512: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Deprecated: use `large_head_attention: auto`. Routes head_dim>256 attention "
+                "through the Triton flash kernel."
+            )
+        },
+    )
+
+    sdpa_varlen: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "With sample packing + attn_implementation=sdpa, route packed rows through "
+                "torch.nn.attention.varlen.varlen_attn (cu_seqlens) instead of an explicit 4D "
+                "block-diagonal mask. Skips cross-document blocks (faster + lower memory) with no "
+                "flash_attn dependency. Left unset (null) it auto-enables when supported (torch >= "
+                "2.10, head_dim <= 256, no sliding window); set true/false to force. When it can't "
+                "be used, packed rows still isolate documents via the block-diagonal mask. "
+                "Sliding-window attention needs torch >= 2.11 (varlen_attn window_size)."
+            )
+        },
+    )
+
+    fused_attn_kernel: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Replace ``q_norm + apply_rotary_pos_emb`` (and the matching k path) "
+                "with a single fused RMSNorm+RoPE Triton kernel launch. Currently "
+                "implemented for Qwen3, Qwen3-MoE, Qwen3.5, and Qwen3.5-MoE "
+                "full-attention layers; Gemma 4 always uses the fused path. GLM-4.7-Flash "
+                "(glm4_moe_lite) fuses partial RoPE and MLA Q/K/V assembly instead; "
+                "latent RMSNorms remain separate and cached decoding uses the original path. Disabled "
+                "(None/False) falls back "
+                "to the eager transformers implementation. Compile-safe via "
+                "torch.library.triton_op — traces under torch.compile(fullgraph=True). "
+                "Per-step wins are arch-dependent: ~+7-12% across sm_86 and sm_120. "
+                "Combining with torch_compile=true is a clear win on sm_120 (+9% "
+                "extra) but currently regresses on sm_86 due to Inductor autotune "
+                "biases — flip them on independently and benchmark."
+            )
+        },
+    )
+
+    experts_implementation: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Which experts implementation to use for MoE models,"
+        },
+    )
+
+    ple_cpu_offload: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Keep parameters the model declares in `_no_placement_params` "
+            "in host RAM instead of VRAM (e.g. Qwen3.8-Flash-Next's 51.2B n-gram PLE "
+            "embedding, 95.4 GiB in bf16, which its forward already gathers on whatever "
+            "device the weight lives on). Each token reads only a handful of rows, so the "
+            "per-step transfer is tens of MB. Requires qlora with load_in_4bit or lora "
+            "with load_in_8bit, and enough host RAM to hold the table."
+        },
+    )
+
+    quantize_moe_experts: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Quantize MoE expert weights on load to reduce VRAM. "
+            "Requires adapter (lora/qlora) with load_in_4bit or load_in_8bit. "
+            "Requires CUDA (not compatible with ROCm or other backends). "
+            "Note: total parameter count may be reported incorrectly when enabled "
+            "(trainable param count is correct)."
+        },
+    )
+
+    scaling_softmax: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to use Scaled Softmax (SSMax) attention. Ref: https://arxiv.org/abs/2501.19399"
+        },
+    )
+    scaling_softmax_factor: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Scaling factor for SSMax attention. Default is 0.43"
+        },
+    )
+    scaling_softmax_bias: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Bias for SSMax attention. Default is 0.0. Note: The paper recommends bias=0 for better length generalization."
+        },
+    )
+
+    lora_mlp_kernel: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Apply custom LoRA autograd functions and activation function Triton kernels for speed and memory savings. See: https://docs.axolotl.ai/docs/lora_optims.html"
+        },
+    )
+    lora_qkv_kernel: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Apply custom LoRA autograd functions and activation function Triton kernels for speed and memory savings. See: https://docs.axolotl.ai/docs/lora_optims.html"
+        },
+    )
+    lora_o_kernel: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Apply custom LoRA autograd functions and activation function Triton kernels for speed and memory savings. See: https://docs.axolotl.ai/docs/lora_optims.html"
+        },
+    )
+    lora_embedding_kernel: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Apply custom LoRA autograd function for embedding layers. See: https://docs.axolotl.ai/docs/lora_optims.html"
+        },
+    )
+
+    chunked_cross_entropy: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to use chunked cross entropy loss for memory efficiency"
+        },
+    )
+    chunked_cross_entropy_num_chunks: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of chunks to use for chunked cross entropy loss"
+        },
+    )
+    use_eaft: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Enable Entropy-Aware Focal Training loss (EAFT)"
+        },
+    )
+    eaft_alpha: float | None = Field(
+        default=1.0,
+        json_schema_extra={
+            "description": "Exponent for entropy weighting in EAFT (default: 1.0)"
+        },
+    )
+    eaft_k: int | None = Field(
+        default=20,
+        json_schema_extra={
+            "description": "Number of top logits for entropy approximation (default: 20)"
+        },
+    )
+    use_dft: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Enable Dynamic Fine-Tuning loss (DFT): per-token cross entropy weighted by its own detached probability"
+        },
+    )
+
+    tiled_mlp: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to use ALST tiled mlp for memory efficient long context"
+        },
+    )
+
+    tiled_mlp_num_shards: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of shards to use for ALST tiled mlp. If unset, it will be set based on seqlen/hidden_size"
+        },
+    )
+
+    tiled_mlp_use_original_mlp: bool | None = Field(
+        default=True,
+        json_schema_extra={
+            "description": "Whether to use original mlp for ALST tiled mlp. Otherwise uses a generic MLP based on llama."
+        },
+    )
+
+    llama4_linearized_experts: bool | None = None
+
+    deepspeed: str | dict[str, Any] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Deepspeed config path. e.g., deepspeed_configs/zero3.json"
+        },
+    )
+    deepcompile: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to use deepcompile for faster training with deepspeed"
+        },
+    )
+    fsdp_config: FSDPConfig | None = Field(
+        default=None, json_schema_extra={"description": "FSDP configuration options"}
+    )
+    fsdp_version: int | None = Field(
+        default=2,
+        json_schema_extra={"description": "FSDP version"},
+    )
+    fp32_norms: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Keep norm modules (RMSNorm/LayerNorm) in fp32 by sharding them "
+                "under their own FSDP2 MixedPrecisionPolicy. Requires fsdp_config."
+            )
+        },
+    )
+    fp32_norm_classes: list[str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Class-name patterns to match for fp32 norm sharding. Patterns "
+                "without a '.' match against type(module).__name__ as a suffix. "
+                "Patterns containing a '.' match the fully qualified class path "
+                "exactly. Defaults to ['RMSNorm', 'LayerNorm'] when fp32_norms is "
+                "true and this is unset."
+            )
+        },
+    )
+    fsdp_final_state_dict_type: (
+        Literal["FULL_STATE_DICT", "LOCAL_STATE_DICT", "SHARDED_STATE_DICT"] | None
+    ) = Field(
+        default=None,
+        deprecated="Configuring FSDP final state dict type using `fsdp_final_state_dict_type` is deprecated. Please use `fsdp_config.final_state_dict_type` instead.",
+    )
+
+    val_set_size: float | None = Field(
+        default=0.0,
+        json_schema_extra={
+            "description": "How much of the dataset to set aside as evaluation. 1 = 100%, 0.50 = 50%, etc. 0 for no eval."
+        },
+    )
+
+    dp_shard_size: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of devices to shard across. If not set, will use all available devices."
+        },
+    )
+    dp_replicate_size: int | None = Field(
+        default=None,
+        json_schema_extra={"description": "Number of devices to replicate across."},
+    )
+    sequence_parallel_degree: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Deprecated: use `context_parallel_size` instead"
+        },
+    )
+    context_parallel_size: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Set to a divisor of the number of GPUs available to split sequences into chunks of equal size. Use in long context training to prevent OOM when sequences cannot fit into a single GPU's VRAM. E.g., if 4 GPUs are available, set this value to 2 to split each sequence into two equal-sized subsequences, or set to 4 to split into four equal-sized subsequences. See https://docs.axolotl.ai/docs/sequence_parallelism.html for more details."
+        },
+    )
+    heads_k_stride: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Optional; strides across the key dimension. Larger values use more memory but should make training faster. Must evenly divide the number of KV heads in your model."
+        },
+    )
+    ring_attn_func: RingAttnFunc | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "One of 'varlen_llama3', 'batch_ring', 'batch_zigzag', 'batch_stripe'. Defaults to 'varlen_llama3' in the sample packing case, and 'batch_ring' in the non-sample packing case."
+        },
+    )
+    tensor_parallel_size: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of tensor parallel processes in TP group. Only supported with DeepSpeed AutoTP."
+        },
+    )
+    special_tokens: SpecialTokensConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Add or change special tokens. If you add tokens here, you don't need to add them to the `tokens` list."
+        },
+    )
+    tokens: list[str] | None = Field(
+        default=None,
+        json_schema_extra={"description": "Add extra tokens to the tokenizer"},
+    )
+    added_tokens_overrides: dict[int, str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Mapping token_id to new_token_string to override reserved added_tokens in the tokenizer. Only works for tokens that are not part of the base vocab (aka are added_tokens). Can be checked if they exist in tokenizer.json added_tokens."
+        },
+    )
+
+    torch_compile: Literal["auto"] | bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to use torch.compile and which backend to use."
+        },
+    )
+    torch_compile_backend: str | None = Field(
+        default=None,
+        json_schema_extra={"description": "Backend to use for torch.compile"},
+    )
+    torch_compile_mode: Literal["default", "reduce-overhead", "max-autotune"] | None = (
+        None
+    )
+    torch_compile_regional: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "With torch_compile, compile each repeated decoder block separately (accelerate's regional compilation) instead of the whole model. Cuts cold-start compile time, but on torch 2.14 it breaks gradient_checkpointing: the checkpoint recompute can run a different Dynamo cache entry than the forward (pytorch/pytorch#166926). Off by default; only enable without gradient checkpointing."
+        },
+    )
+    torch_compile_options: dict[str, bool | int | float | str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Mapping of allowlisted torch._inductor.config flags to set before "
+                "torch.compile runs. Only honored when torch_compile is truthy. "
+                "Allowed keys (see INDUCTOR_COMPILE_OPTIONS_ALLOWLIST in "
+                "axolotl.utils.schemas.enums): coordinate_descent_tuning, "
+                "coordinate_descent_check_all_directions, shape_padding, "
+                "epilogue_fusion, max_autotune_gemm, fx_graph_cache, "
+                "assume_aligned_inputs, comprehensive_padding, "
+                "decompose_mem_bound_mm, triton.cudagraphs. Disallowed keys are "
+                "rejected at config-validation time."
+            )
+        },
+    )
+
+    max_steps: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Maximum number of iterations to train for. It precedes num_epochs which means that if both are set, num_epochs will not be guaranteed. e.g., when 1 epoch is 1000 steps => `num_epochs: 2` and `max_steps: 100` will train for 100 steps"
+        },
+    )
+    warmup_steps: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of warmup steps. Cannot use with warmup_ratio"
+        },
+    )
+    warmup_ratio: float | None = Field(
+        default=None,
+        json_schema_extra={"description": "Warmup ratio. Cannot use with warmup_steps"},
+    )
+    eval_steps: int | float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Leave empty to eval at each epoch, integer for every N steps. float for fraction of total steps"
+        },
+    )
+    evals_per_epoch: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of times per epoch to run evals, mutually exclusive with eval_steps"
+        },
+    )
+    eval_strategy: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Set to `no` to skip evaluation, `epoch` at end of each epoch, leave empty to infer from `eval_steps`"
+        },
+    )
+    eval_on_start: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Run an evaluation before the first training step. Leave empty to keep the default (on whenever evaluation is enabled); set to false to skip the step-0 eval"
+        },
+    )
+
+    save_steps: int | float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Leave empty to save at each epoch, integer for every N steps. float for fraction of total steps"
+        },
+    )
+    saves_per_epoch: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Number of times per epoch to save a checkpoint, mutually exclusive with save_steps"
+        },
+    )
+    save_strategy: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Set to `no` to skip checkpoint saves, `epoch` at end of each epoch, `best` when better result is achieved, leave empty to infer from `save_steps`"
+        },
+    )
+    save_total_limit: int | None = Field(
+        default=None, json_schema_extra={"description": "Checkpoints saved at a time"}
+    )
+    checkpoint_save_retry: CheckpointSaveRetryConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Retry checkpoint file writes that fail with a full disk, exceeded quota or I/O error once, after a pause, before the save fails. See https://docs.axolotl.ai/docs/checkpoint_saving.html"
+        },
+    )
+    checkpoint_mirror: CheckpointMirrorConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Copy each checkpoint from output_dir to a shared directory in the background, so output_dir can be fast local storage. See https://docs.axolotl.ai/docs/checkpoint_saving.html"
+        },
+    )
+    save_first_step: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to checkpoint a model after the first step of training. Defaults to False."
+        },
+    )
+
+    logging_steps: int | None = Field(
+        default=None, json_schema_extra={"description": "Logging frequency"}
+    )
+    logging_nan_inf_filter: bool | None = Field(
+        default=True,
+        json_schema_extra={
+            "description": "HF Trainer option that replaces a NaN/inf loss with the running average in the logged loss (HF default). The check reads the loss on the host every micro-step, one device sync; set to 'false' to remove it."
+        },
+    )
+    early_stopping_patience: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Stop training after this many evaluation losses have increased in a row. https://huggingface.co/transformers/v4.2.2/_modules/transformers/trainer_callback.html#EarlyStoppingCallback"
+        },
+    )
+    load_best_model_at_end: bool | None = False
+    save_only_model: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Save only the model weights, skipping the optimizer. Using this means you can't resume from checkpoints."
+        },
+    )
+    adapter_checkpoint_format: Literal["gather", "sharded"] | None = Field(
+        default="gather",
+        json_schema_extra={
+            "description": "How FSDP2 writes PEFT adapters, for checkpoint-N saves and the end-of-training export to output_dir. 'gather' assembles every adapter tensor on rank 0 before writing adapter_model.safetensors. 'sharded' has every rank write the slices it holds to <dir>/.adapter_shards/, with no cross-rank tensor transfer when every rank sees the output directory, then rank 0 consolidates them into the same adapter_model.safetensors. Checkpoints consolidate on a background thread while training continues: one consolidation runs at a time, and a save that finds one running and one queued waits. Until a checkpoint is consolidated, its on_save callbacks (checkpoint mirror, publishers) and save_total_limit rotation are held back, and training end waits for it; a resume from an unconsolidated checkpoint finishes the consolidation first. The final export waits for outstanding checkpoint consolidations, then consolidates its own shards before training returns. Requires an adapter, fsdp_version 2 with state_dict_type FULL_STATE_DICT (with or without expert_parallel_size), tensor_parallel_size 1, no rl, load_best_model_at_end false, and hub_strategy end when hub_model_id is set; config validation rejects anything else. Single-process runs, multiple adapters, and quantized adapter tensors fall back to 'gather' at save time."
+        },
+    )
+    adapter_final_save_format: Literal["gather", "sharded"] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override adapter_checkpoint_format for the end-of-training export only. Unset follows adapter_checkpoint_format; 'gather' keeps sharded checkpoints but writes the final adapter through the rank 0 gather, e.g. to byte-compare a sharded checkpoint against a gathered export of the same weights."
+        },
+    )
+    use_tensorboard: bool | None = Field(
+        default=None, json_schema_extra={"description": "Use tensorboard for logging"}
+    )
+    sync_profiler_steps: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Debugging aid, separate from profiler_steps (the torch profiler timeline): count host-device synchronizations per micro-step for this many optimizer steps using torch.cuda.set_sync_debug_mode, then log the call sites and write sync_profile.json to output_dir."
+        },
+    )
+    sync_profiler_start_step: int = Field(
+        default=2,
+        json_schema_extra={
+            "description": "Optimizer step at which the sync profiler starts (after warm-up)."
+        },
+    )
+    profiler_steps: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Enable the pytorch profiler to capture the first N steps of training to the output_dir. see https://pytorch.org/blog/understanding-gpu-memory-1/ for more information. Snapshots can be visualized @ https://pytorch.org/memory_viz"
+        },
+    )
+    profiler_steps_start: int | None = Field(
+        default=0,
+        json_schema_extra={
+            "description": "Which step to start the profiler at. Useful for only capturing a few steps mid-run."
+        },
+    )
+    include_tokens_per_second: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "bool of whether to report tokens per second at the end of training. This is not supported with pre-training datasets."
+        },
+    )
+    include_tkps: bool | None = Field(
+        default=True,
+        json_schema_extra={
+            "description": "bool of whether to report tokens per second per-gpu during training by measuring throughput of non-padding tokens."
+        },
+    )
+    neftune_noise_alpha: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "NEFT https://arxiv.org/abs/2310.05914, set this to a number (paper default is 5) to add noise to embeddings. Currently only supported on Llama and Mistral"
+        },
+    )
+
+    orpo_alpha: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Parameter controlling the relative ratio loss weight in the ORPO loss. Passed to `beta` in `ORPOConfig` due to trl mapping."
+        },
+    )
+    simpo_gamma: float | None = Field(
+        default=None,
+        json_schema_extra={"description": "Target reward margin for the SimPO loss"},
+    )
+    cpo_alpha: float | None = Field(
+        default=None, json_schema_extra={"description": "Weight of the BC regularizer"}
+    )
+
+    kto_desirable_weight: float | None = Field(
+        default=None,
+        json_schema_extra={"description": "Factor for desirable loss term in KTO loss"},
+    )
+    kto_undesirable_weight: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Factor for undesirable loss term in KTO loss"
+        },
+    )
+    rl_beta: float | None = Field(
+        default=None,
+        json_schema_extra={"description": "The beta parameter for the RL training"},
+    )
+
+    max_memory: dict[int | Literal["cpu", "disk"], int | str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Defines the max memory usage per gpu on the system. Passed through to transformers when loading the model."
+        },
+    )
+    gpu_memory_limit: int | str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Limit the memory for all available GPUs to this amount (if an integer, expressed in gigabytes); default: unset"
+        },
+    )
+    low_cpu_mem_usage: bool | None = Field(
+        default=None,
+        json_schema_extra={"description": "Whether to use low_cpu_mem_usage"},
+    )
+
+    chat_template: (
+        ChatTemplate
+        | Annotated[str, StringConstraints(pattern="^tokenizer_default_fallback_")]
+    ) | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "The name of the chat template to use for training, following values are supported: tokenizer_default: Uses the chat template that is available in the tokenizer_config.json. If the chat template is not available in the tokenizer, it will raise an error. This is the default value. alpaca/inst/chatml/gemma/cohere/llama3/phi_3/deepseek_v2/jamba: These chat templates are available in the axolotl codebase at src/axolotl/utils/chat_templates.py. tokenizer_default_fallback_*: where * is the name of the chat template to fallback to. E.g. tokenizer_default_fallback_chatml. This is useful when the chat template is not available in the tokenizer. jinja: Uses a custom jinja template for the chat template. The custom jinja template should be provided in the chat_template_jinja field. The selected chat template will be saved to the tokenizer_config.json for easier inferencing"
+        },
+    )
+    chat_template_jinja: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Custom jinja template or path to jinja file for chat template. This will be only used if chat_template is set to `jinja` or `null` (in which case chat_template is automatically set to `jinja`). Default is null."
+        },
+    )
+    chat_template_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Additional kwargs to pass to the chat template. This is useful for customizing the chat template. For example, you can pass `thinking=False` to add a generation prompt to the chat template."
+        },
+    )
+    eot_tokens: list[str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Custom EOT (End-of-Turn) tokens to mask/unmask during training. These tokens mark the boundaries between conversation turns. For example: ['/INST', '</s>', '[/SYSTEM_PROMPT]']. If not specified, defaults to just the model's eos_token. This is useful for templates that use multiple delimiter tokens."
+        },
+    )
+    default_system_message: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Changes the default system message. Currently only supports chatml."
+        },
+    )
+
+    fix_untrained_tokens: int | list[int] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Token index or indices to adjust embedding weights to the mean of the other tokens. "
+                "This is useful when the model has untrained embeddings."
+            )
+        },
+    )
+
+    # INTERNALS - document for now, generally not set externally
+    is_preprocess: bool | None = None
+    preprocess_iterable: bool | None = None
+
+    total_num_tokens: int | None = Field(
+        default=None,
+        json_schema_extra={"description": "Total number of tokens - internal use"},
+    )
+    total_supervised_tokens: int | None = None
+    sample_packing_eff_est: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "You can set these packing optimizations AFTER starting a training at least once. The trainer will provide recommended values for these values."
+        },
+    )
+    axolotl_config_path: str | None = None
+
+    is_falcon_derived_model: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Internal use only - Used to identify which the model is based on"
+        },
+    )
+    is_llama_derived_model: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Internal use only - Used to identify which the model is based on"
+        },
+    )
+    is_mistral_derived_model: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Internal use only - Used to identify which the model is based on. Please note that if you set this to true, `padding_side` will be set to 'left' by default"
+        },
+    )
+    is_qwen_derived_model: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Internal use only - Used to identify which the model is based on"
+        },
+    )
+
+    plugins: list[str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Add plugins to extend the pipeline. See `src/axolotl/integrations` for the available plugins or doc below for more details. https://docs.axolotl.ai/docs/custom_integrations.html"
+        },
+    )
+    generate_samples: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Enable sample generation during training for monitoring"
+        },
+    )
+    num_generation_samples: int | None = Field(
+        default=3,
+        json_schema_extra={
+            "description": "Number of samples to generate at each interval"
+        },
+    )
+    generation_max_new_tokens: int | None = Field(
+        default=50,
+        json_schema_extra={"description": "Maximum new tokens to generate per sample"},
+    )
+    generation_temperature: float | None = Field(
+        default=0.7,
+        json_schema_extra={
+            "description": "Temperature for sample generation (0.0 = greedy)"
+        },
+    )
+    generation_top_p: float | None = Field(
+        default=None,
+        json_schema_extra={"description": "Nucleus sampling parameter for generation"},
+    )
+    generation_top_k: int | None = Field(
+        default=None,
+        json_schema_extra={"description": "Top-k sampling parameter for generation"},
+    )
+    generation_prompt_ratio: float | None = Field(
+        default=0.5,
+        json_schema_extra={"description": "Ratio of input to use as prompt (0.0-1.0)"},
+    )
+    generation_do_sample: bool | None = Field(
+        default=True,
+        json_schema_extra={
+            "description": "Whether to use sampling (vs greedy decoding)"
+        },
+    )
+
+    @field_serializer("datasets")
+    def datasets_serializer(
+        self, ds_configs: list[DatasetConfig] | None
+    ) -> list[dict[str, Any]] | None:
+        if ds_configs:
+            return [ds_config.model_dump(exclude_none=True) for ds_config in ds_configs]
+        return None
+
+    # --- Attention capability flags (derived from attn_implementation) ---
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def attn_supports_packing(self) -> bool:
+        return attn_impl_base(self.attn_implementation) in ATTN_IMPLS_SUPPORTING_PACKING
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def attn_decontaminates_packing(self) -> bool:
+        # sdpa/eager isolate packed docs via the dropped-mask block-diagonal; others can't.
+        if self.attn_supports_packing:
+            return True
+        return self.attn_implementation in ("sdpa", "eager")
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def attn_uses_flash_lib(self) -> bool:
+        return attn_impl_base(self.attn_implementation) in ATTN_IMPLS_USING_FLASH_LIB
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def attn_needs_dtype_cast(self) -> bool:
+        if self.attn_implementation is None:
+            return False
+        return self.attn_implementation not in ATTN_IMPLS_WITHOUT_DTYPE_CAST
+
+    @model_validator(mode="before")
+    @classmethod
+    def warn_peft_trainable_token_to_fix_untrained(cls, data):
+        if (
+            peft_trainable_token_indices := data.get("peft_trainable_token_indices")
+        ) and (fix_untrained_tokens := data.get("fix_untrained_tokens")):
+            if isinstance(fix_untrained_tokens, int):
+                fix_untrained_tokens = (fix_untrained_tokens,)
+
+            if isinstance(peft_trainable_token_indices, int):
+                peft_trainable_token_indices = (peft_trainable_token_indices,)
+
+            trainable_token_ids = (
+                {
+                    token_id
+                    for indices in peft_trainable_token_indices.values()
+                    for token_id in indices
+                }
+                if isinstance(peft_trainable_token_indices, dict)
+                else set(peft_trainable_token_indices)
+            )
+
+            for untrained_token_id in fix_untrained_tokens:
+                if untrained_token_id not in trainable_token_ids:
+                    LOG.warning_once(
+                        f"Token {untrained_token_id} is fixed via `fix_untrained_tokens`, yet not in `peft_trainable_token_indices`. "
+                        "Please add it, otherwise the token won't be trained on."
+                    )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_attn_implementation(cls, data):
+        """Map legacy boolean attention flags to canonical attn_implementation, warn, then strip."""
+        if not isinstance(data, dict):
+            return data
+
+        attn_impl = data.get("attn_implementation")
+        set_flags = [f for f in LEGACY_ATTN_FLAG_TO_IMPL if data.get(f)]
+
+        # gemma4_hybrid requires flash_attention_2 for the sliding-window layers;
+        # post-load patching swaps global layers to sdpa (see
+        # `_apply_gemma_hybrid_attention`). Default it in when the user didn't
+        # pick a backend; reject any incompatible explicit choice.
+        if data.get("gemma4_hybrid_attn_impl"):
+            if not attn_impl and not set_flags:
+                data["attn_implementation"] = "flash_attention_2"
+                attn_impl = "flash_attention_2"
+            elif attn_impl and attn_impl != "flash_attention_2":
+                raise ValueError(
+                    f"gemma4_hybrid_attn_impl requires attn_implementation="
+                    f"flash_attention_2 (sliding-window layers run under FA2); "
+                    f"got {attn_impl!r}."
+                )
+
+        if attn_impl and set_flags:
+            raise ValueError(
+                f"attn_implementation={attn_impl!r} cannot be combined with legacy "
+                f"attention flags ({', '.join(sorted(set_flags))}). The legacy "
+                f"flags are deprecated — set only `attn_implementation`."
+            )
+
+        if not attn_impl and set_flags:
+            # Priority: specific backends beat generic flash/sdp/eager fallbacks.
+            for flag in LEGACY_ATTN_FLAG_TO_IMPL:
+                if flag in set_flags:
+                    canonical = LEGACY_ATTN_FLAG_TO_IMPL[flag]
+                    data["attn_implementation"] = canonical
+                    LOG.warning(
+                        "`%s: true` is deprecated and will be removed in a future "
+                        "release. Use `attn_implementation: %s` instead.",
+                        flag,
+                        canonical,
+                    )
+                    break
+
+        # Strip legacy flags from validated data — canonical field is authoritative.
+        for flag in LEGACY_ATTN_FLAG_TO_IMPL:
+            data.pop(flag, None)
+
+        return data
+
+    @field_validator("large_head_attention", mode="before")
+    @classmethod
+    def validate_large_head_attention(cls, value):
+        """Only the three known policies are valid (a typo must not silently opt into Triton)."""
+        if value is None:
+            return None
+        valid = {"auto", "sdpa", "triton_flash"}
+        if str(value).lower() not in valid:
+            raise ValueError(
+                f"large_head_attention must be one of {sorted(valid)}, got {value!r}"
+            )
+        return str(value).lower()
+
+    @field_validator("attn_implementation", mode="before")
+    @classmethod
+    def validate_attn_implementation(cls, value):
+        """Accept canonical names and hub-kernel paths; reject short-form aliases."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(
+                f"attn_implementation must be a string, got {type(value).__name__}"
+            )
+        if value in CANONICAL_ATTN_IMPLS:
+            return value
+        if "/" in value:
+            # Hub-kernel path, e.g. "kernels-community/flash-attn3". Pass through.
+            return value
+        if value in SHORT_FORM_ALIAS_TO_CANONICAL:
+            canonical = SHORT_FORM_ALIAS_TO_CANONICAL[value]
+            raise ValueError(
+                f"attn_implementation={value!r} is not accepted. "
+                f"Use the canonical name {canonical!r} instead."
+            )
+        raise ValueError(
+            f"attn_implementation={value!r} is not a recognized backend. "
+            f"Expected one of: {sorted(CANONICAL_ATTN_IMPLS)}, or a hub-kernel "
+            f"path containing '/'."
+        )
+
+    @field_validator("torch_compile_options")
+    @classmethod
+    def validate_torch_compile_options(cls, value):
+        """Reject torch_compile_options keys not in INDUCTOR_COMPILE_OPTIONS_ALLOWLIST."""
+        if value is None:
+            return None
+        bad = sorted(set(value.keys()) - INDUCTOR_COMPILE_OPTIONS_ALLOWLIST)
+        if bad:
+            raise ValueError(
+                f"torch_compile_options contains disallowed inductor flags: {bad}. "
+                f"Allowed: {sorted(INDUCTOR_COMPILE_OPTIONS_ALLOWLIST)}."
+            )
+        return value
+
+    @field_validator("label_keep_prob")
+    @classmethod
+    def check_label_keep_prob(cls, value):
+        if value is None:
+            return value
+        if not value:
+            raise ValueError("label_keep_prob must list at least one token id")
+        for token_id, keep_prob in value.items():
+            if token_id < 0:
+                raise ValueError(
+                    f"label_keep_prob token ids must be non-negative, got {token_id}"
+                )
+            if not 0.0 <= keep_prob <= 1.0:
+                raise ValueError(
+                    f"label_keep_prob[{token_id}] must be in [0, 1], got {keep_prob}"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def check_label_keep_prob_trainer(self):
+        if self.label_keep_prob_normalize and not self.label_keep_prob:
+            raise ValueError("label_keep_prob_normalize requires label_keep_prob")
+        if not self.label_keep_prob:
+            return self
+        conflicts = [
+            name
+            for name in (
+                "rl",
+                "reward_model",
+                "process_reward_model",
+                "kd_trainer",
+                "diffusion_lm",
+            )
+            if getattr(self, name, None)
+        ]
+        if conflicts:
+            raise ValueError(
+                "label_keep_prob is only supported for SFT / causal LM training, "
+                f"not with: {', '.join(conflicts)}"
+            )
+        if (self.tensor_parallel_size or 1) > 1:
+            raise ValueError(
+                "label_keep_prob is not supported with tensor_parallel_size > 1: ranks "
+                "that share a batch draw different masks, so the TP ranks would compute "
+                "a shared loss on different targets"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_label_balanced_packing(self):
+        """Label balancing requires static token-level labels and reorderable samples."""
+        if self.balance_labels and (
+            (
+                not self.sample_packing
+                and (self.streaming or self.pretraining_dataset or self.group_by_length)
+            )
+            or self.sample_packing_sequentially
+            or self.curriculum_sampling
+            or self.diffusion_lm
+            or self.rl
+            or self.reward_model
+            or self.process_reward_model
+        ):
+            raise ValueError(
+                "balance_labels requires causal LM "
+                "sample_packing or map-style fixed-count batching without sequential, curriculum, or conflicting length-grouped sampling"
+            )
+        if self.label_balance_window_optim_steps > 1:
+            if not self.balance_labels:
+                raise ValueError(
+                    "label_balance_window_optim_steps requires balance_labels"
+                )
+            if self.streaming or self.pretraining_dataset:
+                raise ValueError(
+                    "label_balance_window_optim_steps > 1 requires non-streaming training"
+                )
+        if self.balance_labels and (self.accelerator_config or {}).get("split_batches"):
+            raise ValueError(
+                "balance_labels requires split_batches=False for optimizer-step grouping"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_torch_compile_options_requires_compile(self):
+        """Require torch_compile enabled when torch_compile_options is set."""
+        if self.torch_compile_options is not None and not self.torch_compile:
+            raise ValueError(
+                "torch_compile_options is set but torch_compile is not enabled. "
+                "Set torch_compile: true (or torch_compile: auto) to use these flags."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_cudagraphs_wo_static_shapes(self):
+        """Warn on triton.cudagraphs + sample_packing: cudagraphs need static shapes, packed seqs are dynamic."""
+        if (
+            self.torch_compile_options
+            and self.torch_compile_options.get("triton.cudagraphs")
+            and self.sample_packing
+        ):
+            LOG.warning(
+                "torch_compile_options has `triton.cudagraphs: true` together with "
+                "`sample_packing: true`. CUDA graphs require static shapes, but "
+                "packed variable-length sequences are dynamic and will trigger graph "
+                "re-capture or fallback. Disable one of them to get the cudagraphs "
+                "speedup."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_fp32_norms(self):
+        if self.fp32_norms:
+            # fsdp_config is the canonical "is_fsdp" signal across axolotl
+            if self.fsdp_config is None:
+                raise ValueError(
+                    "fp32_norms requires FSDP to be enabled "
+                    "(fsdp_config block must be set)."
+                )
+        if self.fp32_norm_classes and not self.fp32_norms:
+            LOG.warning(
+                "fp32_norm_classes is set but fp32_norms is not enabled; "
+                "it will be ignored."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_sdpa_varlen(self):
+        if self.sdpa_varlen:
+            if not self.sample_packing:
+                LOG.warning(
+                    "`sdpa_varlen` only affects packed rows; enable `sample_packing` or it is a no-op."
+                )
+            try:
+                from torch.nn.attention.varlen import varlen_attn  # noqa: F401
+            except ImportError:
+                LOG.warning(
+                    "`sdpa_varlen` needs torch >= 2.10 (torch.nn.attention.varlen); it will be "
+                    "ignored and stock SDPA used."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def check_sageattn_wo_sample_packing(self):
+        if (
+            self.attn_implementation == "sage"
+            and not self.sample_packing
+            and not self.pad_to_sequence_len
+        ):
+            LOG.warning(
+                "We recommend turning on `pad_to_sequence_len` for SageAttention "
+                "without packing. The loss has been observed to explode otherwise."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_sageattn_fft(self):
+        if self.attn_implementation == "sage" and not self.adapter:
+            LOG.warning(
+                "SageAttention full finetuning has been observed to drop loss to 0. "
+                "Monitor the loss, or switch to LoRA/QLoRA or another attention method."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_flash_attention_torch_preflight(self):
+        """`flash_attention_torch` is only usable once transformers registers the backend."""
+        if self.attn_implementation != "flash_attention_torch":
+            return self
+
+        import transformers
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        if "flash_attention_torch" not in ALL_ATTENTION_FUNCTIONS:
+            raise ValueError(
+                "attn_implementation=flash_attention_torch requires a transformers "
+                "release that registers torch's varlen attention backend "
+                "(https://github.com/huggingface/transformers/pull/45153). Installed "
+                f"transformers is {transformers.__version__}."
+            )
+
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_ple_cpu_offload(cls, data):
+        if data.get("ple_cpu_offload"):
+            # both place parameters themselves, so the table would be sharded or gathered
+            if data.get("fsdp_config") is not None:
+                raise ValueError("ple_cpu_offload is not compatible with FSDP")
+            if data.get("deepspeed"):
+                raise ValueError("ple_cpu_offload is not compatible with DeepSpeed")
+            # accelerate only skips its device placement for a bitsandbytes model, and
+            # these are the pairings `_set_quantization_config` actually builds one for
+            adapter = data.get("adapter")
+            if not (
+                (adapter == "qlora" and data.get("load_in_4bit"))
+                or (adapter == "lora" and data.get("load_in_8bit"))
+            ):
+                raise ValueError(
+                    "ple_cpu_offload requires qlora with load_in_4bit or lora with "
+                    "load_in_8bit"
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_save_strategy_best_requires_metric(cls, data):
+        if data.get("save_strategy") == "best" and not data.get(
+            "metric_for_best_model"
+        ):
+            raise ValueError(
+                "save_strategy: 'best' requires metric_for_best_model to be set. "
+                "Please specify the metric to use, e.g. metric_for_best_model: eval_loss"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_lora_target_modules_regex(cls, data):
+        lora_target_modules = data.get("lora_target_modules")
+        if not isinstance(lora_target_modules, list):
+            return data
+        invalid = []
+        for pattern in lora_target_modules:
+            if not isinstance(pattern, str):
+                continue
+            try:
+                re.compile(pattern)
+            except re.error:
+                invalid.append(pattern)
+        if invalid:
+            raise ValueError(
+                f"lora_target_modules contains invalid regex pattern(s): {invalid}. "
+                "Please provide valid Python regex patterns or plain module name strings."
+            )
+        return data
+
+
+class AxolotlConfigWCapabilities(AxolotlInputConfig):
+    """Wrapper to valdiate GPU capabilities with the configured options"""
+
+    capabilities: GPUCapabilities
+    env_capabilities: EnvCapabilities
+
+    @model_validator(mode="after")
+    def check_bf16(self):
+        if self.capabilities.bf16:
+            if not self.bf16 and not self.bfloat16:
+                LOG.info(
+                    "bf16 support detected, but not enabled for this configuration."
+                )
+        else:
+            if (
+                not self.merge_lora
+                and not self.is_preprocess
+                and (self.bf16 is True or self.bfloat16 is True)
+            ):
+                LOG.warning(
+                    "bf16 requested, but AMP is not supported on this GPU. Requires Ampere series or above. Training will fail, but other operations (such as merging) are still functional."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def check_tf32(self):
+        if self.tf32 == "auto":
+            self.tf32 = self.capabilities.tf32
+        return self
+
+    @model_validator(mode="after")
+    def check_fp8(self):
+        if self.fp8 and not self.capabilities.fp8:
+            raise ValueError("fp8 requested, but fp8 is not supported on this GPU")
+        elif self.fp8 and self.capabilities.fp8 and not is_fp8_available():
+            raise ValueError(
+                "fp8 requested, but missing one of ms-amp, transformers-engine or torchao."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_ple_cpu_offload_multi_gpu(self):
+        n_gpu = self.capabilities.n_gpu if self.capabilities else 1
+        if self.ple_cpu_offload and n_gpu and n_gpu > 1:
+            # FSDP and DeepSpeed are already hard errors; this is the DDP case
+            LOG.warning(
+                "ple_cpu_offload has only been validated on a single GPU. Under DDP every "
+                "rank keeps its own copy of the table in host RAM."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_sample_packing_w_sdpa_bf16(self):
+        cc = self.capabilities.compute_capability if self.capabilities else None
+        # the torch issue below is pre-Hopper, so anything sm_90 or newer is unaffected
+        is_hopper_or_newer = bool(
+            cc and cc.startswith("sm_") and int(cc.split("_", 1)[1]) >= 90
+        )
+        if (
+            self.sample_packing
+            and self.attn_implementation == "sdpa"
+            and (self.bfloat16 or self.bf16)
+            and not is_hopper_or_newer
+        ):
+            # https://github.com/pytorch/pytorch/blob/1b03423526536b5f3d35bdfa95ccc6197556cf9b/test/test_transformers.py#L2440-L2450
+            LOG.warning(
+                "sample_packing & torch sdpa with bf16 is unsupported may results in 0.0 loss. "
+                "This may work on H100s."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_compute_capability_w_sageattn(self):
+        if (
+            self.attn_implementation == "sage"
+            and self.capabilities
+            and self.capabilities.compute_capability
+            not in ["sm_80", "sm_86", "sm_89", "sm_90", "sm_120"]
+        ):
+            raise ValueError(
+                "SageAttention supports compute capability between sm_80 and sm_120. "
+                "Please use a different attention implementation."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_fp8_attention_preflight(self):
+        """fp8 attention requires SM90+ (torchao >= 0.17 is pinned)."""
+        if self.attn_implementation != "fp8":
+            return self
+
+        if self.capabilities and self.capabilities.compute_capability:
+            cc = self.capabilities.compute_capability
+            # Accept sm_90 (H100/H200), sm_100 (B100/B200), sm_120 (B300-class).
+            if not cc.startswith("sm_") or int(cc.split("_", 1)[1]) < 90:
+                raise ValueError(
+                    f"attn_implementation=fp8 requires compute capability sm_90 or "
+                    f"higher (Hopper+). Detected {cc!r}."
+                )
+
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_quantize_moe_experts(cls, data):
+        if data.get("quantize_moe_experts"):
+            if data.get("lora_target_linear"):
+                raise ValueError(
+                    "lora_target_linear is not compatible with quantize_moe_experts. "
+                    "Use lora_target_parameters to target expert weights instead."
+                )
+            if data.get("adapter") not in ("lora", "qlora"):
+                raise ValueError("quantize_moe_experts requires adapter: lora or qlora")
+            if not (data.get("load_in_4bit") or data.get("load_in_8bit")):
+                raise ValueError(
+                    "quantize_moe_experts requires load_in_4bit or load_in_8bit"
+                )
+            if (
+                data.get("capabilities")
+                and data["capabilities"].get("compute_capability")
+                and not data["capabilities"]["compute_capability"].startswith("sm_")
+            ):
+                raise ValueError(
+                    "quantize_moe_experts requires CUDA (not compatible with ROCm or other backends)"
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_lora_fp32_gradients(cls, data):
+        if data.get("lora_fp32_gradients"):
+            if data.get("adapter") not in ("lora", "qlora", "multilora"):
+                raise ValueError("lora_fp32_gradients requires a LoRA adapter")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_auto_enable_lora_kernels(cls, data):
+        if lora_kernels_auto_enable(data.get):
+            # Auto-enable kernels if not explicitly set by user
+            if data.get("lora_mlp_kernel") is None:
+                data["lora_mlp_kernel"] = True
+
+            if data.get("lora_qkv_kernel") is None:
+                data["lora_qkv_kernel"] = True
+
+            if data.get("lora_o_kernel") is None:
+                data["lora_o_kernel"] = True
+
+            if data.get("lora_embedding_kernel") is None:
+                data["lora_embedding_kernel"] = True
+
+            LOG.warning(
+                "Auto-enabling LoRA kernel optimizations for faster training. "
+                + "Please explicitly set `lora_*_kernel` config values to `false` to disable. "
+                + "See https://docs.axolotl.ai/docs/lora_optims.html for more info."
+            )
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_torch_compile_auto(cls, data):
+        if data.get("torch_compile") == "auto":
+            env_capabilities = data.get("env_capabilities", {})
+            if env_capabilities.get("torch_version"):
+                LOG.info("torch.compile is available, setting torch_compile to True")
+                data["torch_compile"] = True
+            else:
+                data["torch_compile"] = False
+            if data["torch_compile"] is False and data.get("torch_compile_options"):
+                LOG.warning(
+                    "torch_compile: auto resolved to False on this environment "
+                    "(torch version unknown); ignoring torch_compile_options."
+                )
+                data["torch_compile_options"] = None
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_beta_and_trl_beta_match(cls, data):
+        trl_beta = (data.get("trl") or {}).get("beta")
+        if data.get("rl_beta") and trl_beta and data["rl_beta"] != trl_beta:
+            raise ValueError("rl_beta and trl.beta must match or one must be removed")
+        return data
+
+    @model_validator(mode="after")
+    def check_min_torch_version(self):
+        if self.env_capabilities and self.env_capabilities.torch_version:
+            torch_version = self.env_capabilities.torch_version
+            if version.parse(torch_version) < version.parse("2.13.0"):
+                LOG.warning(
+                    f"torch=={torch_version} may not be supported. Please upgrade to torch>=2.13.0."
+                )
+
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_qat_config(cls, data):
+        qat_cfg = data.get("qat", {})
+        if not qat_cfg:
+            return data
+
+        if data.get("peft"):
+            raise ValueError("QAT and PEFT cannot be used together.")
+
+        if data.get("load_in_8bit"):
+            raise ValueError("QAT and load_in_8bit cannot be used together.")
+
+        if data.get("load_in_4bit"):
+            raise ValueError("QAT and load_in_4bit cannot be used together.")
+
+        if qat_cfg.get("weight_dtype") == "ternary" and qat_cfg.get(
+            "activation_dtype"
+        ) not in (None, "int8"):
+            raise ValueError("Ternary QAT only supports activation_dtype: int8.")
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_dataloader_opts(cls, data):
+        if (
+            data.get("dataloader_num_workers") is None
+            and data.get("dataloader_pin_memory") is None
+            and data.get("dataloader_prefetch_factor") is None
+        ):
+            data["dataloader_num_workers"] = data.get("capabilities").get("n_gpu", 1)
+            data["dataloader_pin_memory"] = True
+            data["dataloader_prefetch_factor"] = 256
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_dataset_num_proc(cls, data):
+        if data.get("dataset_processes") is not None:
+            if data.get("dataset_num_proc") is None:
+                data["dataset_num_proc"] = data["dataset_processes"]
+                LOG.warning(
+                    "dataset_processes is deprecated and will be removed in a future version. "
+                    "Please use dataset_num_proc instead."
+                )
+            else:
+                LOG.warning(
+                    "Both dataset_processes and dataset_num_proc are set. "
+                    "Using dataset_num_proc and ignoring dataset_processes."
+                )
+            del data["dataset_processes"]
+        elif data.get("dataset_num_proc") is None:
+            data["dataset_num_proc"] = get_default_process_count()
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_gc_steps(cls, data):
+        gc_steps = data.get("gc_steps")
+        if gc_steps is not None:
+            if (
+                data.get("torch_empty_cache_steps") is None
+                and data.get("gc_collect_steps") is None
+            ):
+                # Map gc_steps to both new options to preserve original behavior
+                if gc_steps > 0:
+                    data["torch_empty_cache_steps"] = gc_steps
+                data["gc_collect_steps"] = gc_steps
+                LOG.warning(
+                    "`gc_steps` is deprecated; mapping gc_steps=%d to "
+                    "`torch_empty_cache_steps` and `gc_collect_steps`.",
+                    gc_steps,
+                )
+            else:
+                LOG.warning(
+                    "`gc_steps` ignored; `torch_empty_cache_steps` / "
+                    "`gc_collect_steps` take precedence."
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_deduplication_with_streaming(cls, data):
+        if data.get("dataset_exact_deduplication") and (
+            data.get("streaming") or data.get("pretraining_dataset")
+        ):
+            raise NotImplementedError(
+                "dataset_exact_deduplication is not available for streaming datasets. "
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_deduplication_with_skip_prepare(cls, data):
+        if data.get("dataset_exact_deduplication") and data.get("skip_prepare_dataset"):
+            raise ValueError(
+                "dataset_exact_deduplication=True has no effect when "
+                "skip_prepare_dataset=True. Deduplication runs as part of the "
+                "prepare pipeline, which is skipped. Either set "
+                "skip_prepare_dataset: false or disable "
+                "dataset_exact_deduplication."
+            )
+        return data

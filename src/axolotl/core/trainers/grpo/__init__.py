@@ -1,0 +1,371 @@
+"""GRPO Specific Strategy for training"""
+
+import importlib
+import inspect
+import os
+import warnings
+from typing import Any
+
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
+from trl.trainer.grpo_trainer import RewardFunc
+
+from axolotl.core.trainers.grpo.args import AxolotlAsyncGRPOConfig, AxolotlGRPOConfig
+from axolotl.core.trainers.grpo.trainer import (
+    AxolotlAsyncGRPOTrainer,
+    AxolotlGRPOContextParallelTrainer,
+    AxolotlGRPOSequenceParallelTrainer,  # noqa: F401  deprecated alias, kept importable
+    AxolotlGRPOTrainer,
+)
+from axolotl.utils.dict import DictDefault
+from axolotl.utils.logging import get_logger
+from axolotl.utils.schemas.trl import TRLConfig
+from axolotl.utils.schemas.vllm import VllmConfig
+
+LOG = get_logger(__name__)
+
+
+class GRPOStrategy:
+    """Strategy for GRPO training"""
+
+    @classmethod
+    def get_trainer_class(
+        cls,
+        context_parallel: bool = False,
+        async_grpo: bool = False,
+        sequence_parallel: bool | None = None,
+    ) -> (
+        type[AxolotlGRPOTrainer]
+        | type[AxolotlGRPOContextParallelTrainer]
+        | type[AxolotlAsyncGRPOTrainer]
+    ):
+        if sequence_parallel is not None:
+            warnings.warn(
+                "`sequence_parallel` is deprecated; use `context_parallel`",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            context_parallel = context_parallel or sequence_parallel
+        if context_parallel and async_grpo:
+            raise ValueError(
+                "context_parallel and async_grpo cannot both be enabled. "
+                "Disable one of context_parallel_size > 1 or async_prefetch/use_data_producer."
+            )
+        if context_parallel:
+            return AxolotlGRPOContextParallelTrainer
+        if async_grpo:
+            return AxolotlAsyncGRPOTrainer
+        return AxolotlGRPOTrainer
+
+    @classmethod
+    def get_training_args_class(
+        cls, async_grpo: bool = False
+    ) -> type[AxolotlGRPOConfig] | type[AxolotlAsyncGRPOConfig]:
+        if async_grpo:
+            return AxolotlAsyncGRPOConfig
+        return AxolotlGRPOConfig
+
+    @staticmethod
+    def get_vllm_kwargs(trl: TRLConfig, vllm_cfg: VllmConfig | None) -> dict[str, Any]:
+        """Map `trl.vllm_*` and the `vllm:` block onto TRL's vLLM training args.
+
+        Unset values are omitted so TRL's defaults apply (notably colocate's 0.3 GPU
+        memory utilization, which leaves room for training on the shared GPU).
+        """
+        kwargs: dict[str, Any] = {"use_vllm": True}
+        if trl.vllm_mode:
+            kwargs["vllm_mode"] = trl.vllm_mode
+        if trl.vllm_mode == "colocate":
+            if trl.vllm_enable_sleep_mode is not None:
+                kwargs["vllm_enable_sleep_mode"] = trl.vllm_enable_sleep_mode
+            if vllm_cfg:
+                engine_kwargs = {
+                    "vllm_gpu_memory_utilization": vllm_cfg.gpu_memory_utilization,
+                    "vllm_tensor_parallel_size": vllm_cfg.tensor_parallel_size,
+                    "vllm_max_model_length": vllm_cfg.max_model_len,
+                }
+                kwargs.update({k: v for k, v in engine_kwargs.items() if v is not None})
+        server_host = trl.vllm_server_host or (vllm_cfg.host if vllm_cfg else None)
+        if server_host:
+            kwargs["vllm_server_host"] = server_host
+        server_port = trl.vllm_server_port or (vllm_cfg.port if vllm_cfg else None)
+        if server_port:
+            kwargs["vllm_server_port"] = server_port
+        if trl.vllm_server_timeout:
+            kwargs["vllm_server_timeout"] = trl.vllm_server_timeout
+        return kwargs
+
+    @classmethod
+    def set_training_args_kwargs(cls, cfg: DictDefault) -> dict[str, Any]:
+        grpo_args_kwargs: dict[str, Any] = {}
+
+        if not hasattr(cfg, "trl") or not cfg.trl:
+            return grpo_args_kwargs
+
+        trl: TRLConfig = cfg.trl  # type: ignore
+
+        if trl.use_vllm:
+            grpo_args_kwargs.update(cls.get_vllm_kwargs(trl, cfg.vllm))
+            if trl.vllm_guided_decoding_regex:
+                # TRL >=1.7 renamed guided decoding to structured outputs.
+                grpo_args_kwargs["vllm_structured_outputs_regex"] = (
+                    trl.vllm_guided_decoding_regex
+                )
+
+        if trl.num_generations:
+            grpo_args_kwargs["num_generations"] = trl.num_generations
+        if trl.generation_batch_size is not None:
+            grpo_args_kwargs["generation_batch_size"] = trl.generation_batch_size
+
+        if trl.sync_ref_model:
+            grpo_args_kwargs["sync_ref_model"] = trl.sync_ref_model
+
+            if trl.ref_model_mixup_alpha:
+                grpo_args_kwargs["ref_model_mixup_alpha"] = trl.ref_model_mixup_alpha
+
+            if trl.ref_model_sync_steps:
+                grpo_args_kwargs["ref_model_sync_steps"] = trl.ref_model_sync_steps
+
+        grpo_args_kwargs["max_completion_length"] = trl.max_completion_length
+        grpo_args_kwargs["log_completions"] = trl.log_completions
+        grpo_args_kwargs["num_completions_to_print"] = trl.num_completions_to_print
+
+        if cfg.context_parallel_size > 1:
+            grpo_args_kwargs["context_parallel_size"] = cfg.context_parallel_size
+
+        if trl.importance_sampling_level is not None:
+            grpo_args_kwargs["importance_sampling_level"] = (
+                trl.importance_sampling_level
+            )
+
+        if trl.reward_weights:
+            grpo_args_kwargs["reward_weights"] = trl.reward_weights
+
+        if trl.scale_rewards is not None:
+            grpo_args_kwargs["scale_rewards"] = trl.scale_rewards
+
+        if trl.loss_type is not None:
+            grpo_args_kwargs["loss_type"] = trl.loss_type
+        if trl.mask_truncated_completions is not None:
+            grpo_args_kwargs["mask_truncated_completions"] = (
+                trl.mask_truncated_completions
+            )
+
+        if trl.temperature is not None:
+            grpo_args_kwargs["temperature"] = trl.temperature
+        if trl.top_p is not None:
+            grpo_args_kwargs["top_p"] = trl.top_p
+        if trl.top_k is not None:
+            grpo_args_kwargs["top_k"] = trl.top_k
+        if trl.min_p is not None:
+            grpo_args_kwargs["min_p"] = trl.min_p
+        if trl.repetition_penalty is not None:
+            grpo_args_kwargs["repetition_penalty"] = trl.repetition_penalty
+
+        if trl.num_iterations is not None:
+            grpo_args_kwargs["num_iterations"] = trl.num_iterations
+        if trl.epsilon is not None:
+            grpo_args_kwargs["epsilon"] = trl.epsilon
+        if trl.epsilon_high is not None:
+            grpo_args_kwargs["epsilon_high"] = trl.epsilon_high
+
+        if trl.use_liger_loss is not None:
+            grpo_args_kwargs["use_liger_kernel"] = trl.use_liger_loss
+
+        if trl.multi_objective_aggregation is not None:
+            grpo_args_kwargs["multi_objective_aggregation"] = (
+                trl.multi_objective_aggregation
+            )
+
+        # Entropy regularization (TRL >= 1.8)
+        if trl.entropy_coef is not None:
+            grpo_args_kwargs["entropy_coef"] = trl.entropy_coef
+        if trl.use_adaptive_entropy is not None:
+            grpo_args_kwargs["use_adaptive_entropy"] = trl.use_adaptive_entropy
+        if trl.entropy_target is not None:
+            grpo_args_kwargs["entropy_target"] = trl.entropy_target
+        if trl.entropy_coef_delta is not None:
+            grpo_args_kwargs["entropy_coef_delta"] = trl.entropy_coef_delta
+        if trl.entropy_coef_min is not None:
+            grpo_args_kwargs["entropy_coef_min"] = trl.entropy_coef_min
+        if trl.entropy_coef_max is not None:
+            grpo_args_kwargs["entropy_coef_max"] = trl.entropy_coef_max
+
+        # Bidirectional vLLM importance-sampling clip (TRL >= 1.6)
+        if trl.vllm_importance_sampling_clip_min is not None:
+            grpo_args_kwargs["vllm_importance_sampling_clip_min"] = (
+                trl.vllm_importance_sampling_clip_min
+            )
+        if trl.vllm_importance_sampling_clip_max is not None:
+            grpo_args_kwargs["vllm_importance_sampling_clip_max"] = (
+                trl.vllm_importance_sampling_clip_max
+            )
+
+        if trl.log_multimodal is not None:
+            grpo_args_kwargs["log_multimodal"] = trl.log_multimodal
+
+        # Async GRPO fields
+        if getattr(trl, "use_data_producer", None) is not None:
+            grpo_args_kwargs["use_data_producer"] = trl.use_data_producer
+        if getattr(trl, "async_prefetch", None) is not None:
+            grpo_args_kwargs["async_prefetch"] = trl.async_prefetch
+        if getattr(trl, "prefetch_depth", None) is not None:
+            grpo_args_kwargs["prefetch_depth"] = trl.prefetch_depth
+        if getattr(trl, "vllm_sync_interval", None) is not None:
+            grpo_args_kwargs["vllm_sync_interval"] = trl.vllm_sync_interval
+        if getattr(trl, "streaming_partial_batch", None) is not None:
+            grpo_args_kwargs["streaming_partial_batch"] = trl.streaming_partial_batch
+        if getattr(trl, "streaming_min_groups", None) is not None:
+            grpo_args_kwargs["streaming_min_groups"] = trl.streaming_min_groups
+        if getattr(trl, "vllm_importance_sampling_correction", None) is not None:
+            grpo_args_kwargs["vllm_importance_sampling_correction"] = (
+                trl.vllm_importance_sampling_correction
+            )
+        if getattr(trl, "vllm_importance_sampling_mode", None) is not None:
+            grpo_args_kwargs["vllm_importance_sampling_mode"] = (
+                trl.vllm_importance_sampling_mode
+            )
+        if getattr(trl, "vllm_importance_sampling_cap", None) is not None:
+            grpo_args_kwargs["vllm_importance_sampling_cap"] = (
+                trl.vllm_importance_sampling_cap
+            )
+        if getattr(trl, "off_policy_mask_threshold", None) is not None:
+            grpo_args_kwargs["off_policy_mask_threshold"] = (
+                trl.off_policy_mask_threshold
+            )
+        if getattr(trl, "use_bias_correction_kl", None) is not None:
+            grpo_args_kwargs["use_bias_correction_kl"] = trl.use_bias_correction_kl
+
+        # Fast Async GRPO fields
+        if getattr(trl, "reward_num_workers", None) is not None:
+            grpo_args_kwargs["reward_num_workers"] = trl.reward_num_workers
+        if getattr(trl, "replay_buffer_size", None) is not None:
+            grpo_args_kwargs["replay_buffer_size"] = trl.replay_buffer_size
+        if getattr(trl, "replay_recompute_logps", None) is not None:
+            grpo_args_kwargs["replay_recompute_logps"] = trl.replay_recompute_logps
+        if getattr(trl, "reroll_start_fraction", None) is not None:
+            grpo_args_kwargs["reroll_start_fraction"] = trl.reroll_start_fraction
+        if getattr(trl, "reroll_max_groups", None) is not None:
+            grpo_args_kwargs["reroll_max_groups"] = trl.reroll_max_groups
+        if getattr(trl, "skip_zero_advantage_batches", None) is not None:
+            grpo_args_kwargs["skip_zero_advantage_batches"] = (
+                trl.skip_zero_advantage_batches
+            )
+        if getattr(trl, "vllm_lora_sync", None) is not None:
+            grpo_args_kwargs["vllm_lora_sync"] = trl.vllm_lora_sync
+
+        # Batch flattening (top-level config, not under trl)
+        if getattr(cfg, "batch_flattening", None):
+            grpo_args_kwargs["batch_flattening"] = cfg.batch_flattening
+
+        return grpo_args_kwargs
+
+    @classmethod
+    def set_trainer_args(cls, cfg: DictDefault) -> list[Any]:
+        trainer_args = []
+        if cfg.trl and cfg.trl.reward_funcs:
+            reward_funcs = []
+            for reward_func_fqn in cfg.trl.reward_funcs:
+                reward_funcs.append(cls.get_reward_func(reward_func_fqn))
+            trainer_args.append(reward_funcs)
+
+        return trainer_args
+
+    @classmethod
+    def set_trainer_kwargs(cls, cfg: DictDefault) -> dict[str, Any]:
+        trainer_kwargs = {}
+        if cfg.trl and cfg.trl.reward_processing_classes:
+            trainer_kwargs["reward_processing_classes"] = (
+                cfg.trl.reward_processing_classes
+            )
+        if cfg.trl and cfg.trl.rollout_func:
+            trainer_kwargs["rollout_func"] = cls.get_rollout_func(cfg.trl.rollout_func)
+
+        return trainer_kwargs
+
+    @classmethod
+    def get_collator(cls, *args, **kwargs):
+        # No data collation is needed in GRPO, handled by trl's trainer __init__
+        return None
+
+    @classmethod
+    def get_blocklist_args_kwargs(cls) -> list[str]:
+        return [
+            "dataset_num_proc",
+            "max_length",
+            "include_tokens_per_second",
+            "max_prompt_length",
+        ]
+
+    @classmethod
+    def get_reward_func(cls, reward_func_fqn: str) -> RewardFunc:
+        """
+        Returns the reward function from the given fully qualified name, or the path to the reward function model.
+
+        Args:
+            reward_func_fqn (str): Fully qualified name of the reward function (e.g. r1_grpo.gsm8k_transform),
+                or a HF hub path to the reward model.
+
+        Returns:
+            RewardFunc: A callable that accepts prompts and completions and returns rewards,
+                or a path to a reward model.
+
+        Raises:
+            ValueError: If the reward function does not accept at least two arguments.
+        """
+        try:
+            # use importlib to dynamically load the reward function from the module
+            reward_func_module_name = reward_func_fqn.split(".")[-1]
+            reward_func_module = importlib.import_module(
+                ".".join(reward_func_fqn.split(".")[:-1])
+            )
+            reward_func = getattr(reward_func_module, reward_func_module_name)
+            if not len(inspect.signature(reward_func).parameters) >= 2:
+                raise ValueError(
+                    "Reward function must accept at least two arguments: prompts: list and completions: list"
+                )
+            return reward_func
+        except ModuleNotFoundError as exc:
+            # the user has passed a string (ideally indicating the path of a reward model)
+            # check if it's a local dir path and not empty dir to a reward model
+            pretrained_log_msg = f"Reward function {reward_func_fqn} is a pre-trained model path - if this is unexpected, please check the reward function path."
+            if os.path.isdir(reward_func_fqn) and os.listdir(reward_func_fqn):
+                LOG.info(pretrained_log_msg)
+                return reward_func_fqn
+            try:
+                snapshot_download(reward_func_fqn, repo_type="model")
+                LOG.info(pretrained_log_msg)
+                return reward_func_fqn
+            except (HfHubHTTPError, LocalEntryNotFoundError):
+                raise ValueError(
+                    f"Reward function {reward_func_fqn} not found."
+                ) from exc
+
+    @classmethod
+    def get_rollout_func(cls, rollout_func_fqn: str):
+        """
+        Returns the rollout function from the given fully qualified name.
+
+        Args:
+            rollout_func_fqn (str): Fully qualified name of the rollout function
+                                    (e.g. my_module.my_rollout_func)
+
+        Returns:
+            Callable rollout function
+        """
+        try:
+            rollout_func_module_name = rollout_func_fqn.split(".")[-1]
+            rollout_func_module = importlib.import_module(
+                ".".join(rollout_func_fqn.split(".")[:-1])
+            )
+            rollout_func = getattr(rollout_func_module, rollout_func_module_name)
+
+            if not callable(rollout_func):
+                raise ValueError(
+                    f"Rollout function {rollout_func_fqn} must be callable"
+                )
+
+            return rollout_func
+
+        except ModuleNotFoundError as exc:
+            raise ValueError(f"Rollout function {rollout_func_fqn} not found.") from exc

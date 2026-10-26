@@ -1,0 +1,746 @@
+"""LoRA-aware sonicmoe experts forward for the transformers ExpertsInterface.
+
+Dense experts materialize expert LoRA via ``MoELoRAMaterialize`` and hand the result
+to upstream's ``sonicmoe_experts_forward`` through a facade, or, with ``sonicmoe_lora_split``,
+keep the base in sonic-moe's GEMMs and add the LoRA as low-rank addends (``lora_split``).
+NVFP4 experts (which the CUTLASS kernel cannot read) take the grouped dequant path in
+``nvfp4_lora`` instead, and non-gated relu² experts (nemotron_h) the grouped MLP in
+``nongated``.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn.functional as F
+from transformers import TrainerCallback
+
+from .lora import (
+    MoELoRAMaterialize,
+    get_lora_params_from_wrapper,
+    has_lora,
+    materialize_expert_lora,
+    unwrap_experts_lora,
+)
+from .lora_split import lora_split_applies, sonicmoe_lora_split_forward
+
+
+def _maybe_unwrap_param_wrapper(param):
+    """Return ``(base_tensor, lora_params_or_None)`` for a PEFT-wrapped Parameter."""
+    try:
+        from peft.tuners.param_wrapper import ParamWrapper
+    except ImportError:
+        return param, None
+
+    if not isinstance(param, ParamWrapper):
+        return param, None
+
+    base = param.original_parameter
+    lora_A, lora_B, scaling = get_lora_params_from_wrapper(param)
+    if lora_A is None:
+        return base, None
+    return base, (lora_A, lora_B, scaling)
+
+
+def _resolve_weights_and_lora(experts_module):
+    """Resolve raw expert weights/biases + optional LoRA tuples.
+
+    Handles both PEFT layouts: module-level wrap (walked via ``unwrap_experts_lora``)
+    and per-parameter ``ParamWrapper``. No layout permute applied.
+    """
+    w1_attr = "gate_up_proj" if hasattr(experts_module, "gate_up_proj") else "up_proj"
+
+    # The ParamWrapper fastpath (experts_lora_fastpath) resolves the LoRA tuples itself and
+    # hands them over before calling the raw base module.
+    fastpath_lora = getattr(experts_module, "_sonicmoe_lora", None)
+    if fastpath_lora is not None:
+        w1 = getattr(experts_module, w1_attr)
+        w2 = experts_module.down_proj
+        b1 = getattr(experts_module, w1_attr + "_bias", None)
+        b2 = getattr(experts_module, "down_proj_bias", None)
+        return (
+            w1,
+            b1,
+            w2,
+            b2,
+            fastpath_lora.get(w1_attr),
+            fastpath_lora.get("down_proj"),
+        )
+
+    if has_lora(experts_module):
+        base_experts, lora_dict = unwrap_experts_lora(experts_module)
+        w1 = getattr(base_experts, w1_attr)
+        w2 = base_experts.down_proj
+        b1 = getattr(base_experts, w1_attr + "_bias", None)
+        b2 = getattr(base_experts, "down_proj_bias", None)
+        return w1, b1, w2, b2, lora_dict.get(w1_attr), lora_dict.get("down_proj")
+
+    w1, lora_w1 = _maybe_unwrap_param_wrapper(getattr(experts_module, w1_attr))
+    w2, lora_w2 = _maybe_unwrap_param_wrapper(experts_module.down_proj)
+    b1 = getattr(experts_module, w1_attr + "_bias", None)
+    b2 = getattr(experts_module, "down_proj_bias", None)
+    return w1, b1, w2, b2, lora_w1, lora_w2
+
+
+# sonic-moe's GEGLU epilogue is itself tanh-approximate (quack ``activation.geglu``), so these
+# map onto it exactly. Without this Gemma resolves to no ``hidden_act`` and silently runs SwiGLU.
+_ACT_ALIASES = {
+    "gelu_pytorch_tanh": "gelu",
+    "gelu_tanh": "gelu",
+}
+
+
+class _FacadeConfig:
+    __slots__ = ("hidden_act",)
+
+    def __init__(self, hidden_act: str):
+        self.hidden_act = hidden_act
+
+
+class _LoRAExpertsFacade:
+    """Stand-in module exposing ``W_eff`` where upstream reads the raw expert weights.
+
+    Upstream reads all of these as plain attributes, so reusing its forward beats
+    duplicating the unwrap, permute and kernel call. Activation resolves via
+    ``resolve_gated_activation`` because Gemma stores its own under ``hidden_activation``,
+    where upstream's ``hidden_act`` lookup silently yields SwiGLU.
+
+    Must stay a plain class: ``SimpleNamespace`` is constructed inside the compiled region
+    and Dynamo cannot trace its ``__new__``, which breaks ``fullgraph=True``.
+    """
+
+    __slots__ = (
+        "config",
+        "down_proj",
+        "down_proj_bias",
+        "gate_up_proj",
+        "gate_up_proj_bias",
+        "has_bias",
+        "has_gate",
+        "has_post_expert_norm",
+        "is_concatenated",
+        "is_transposed",
+        "num_experts",
+    )
+
+    def __init__(self, experts_module, w1, b1, w2, b2, act: str | None = None):
+        from .nvfp4 import resolve_gated_activation
+
+        concat = getattr(experts_module, "is_concatenated", True)
+        # An explicit ``act`` means rewritten non-gated weights: no ``_apply_gate`` to probe.
+        if act is None:
+            from .epilogue import check_epilogue
+
+            act = resolve_gated_activation(experts_module.config)
+            # The fused kernel has no clamp, so the dense path can only ever compute limit=None.
+            check_epilogue(experts_module, act, concat=concat, limit=None, path="dense")
+
+        self.has_gate = True
+        self.gate_up_proj = w1
+        self.down_proj = w2
+        self.has_bias = b1 is not None or b2 is not None
+        self.gate_up_proj_bias = b1
+        self.down_proj_bias = b2
+        self.has_post_expert_norm = getattr(
+            experts_module, "has_post_expert_norm", False
+        )
+        self.is_transposed = getattr(experts_module, "is_transposed", False)
+        self.is_concatenated = concat
+        self.num_experts = experts_module.num_experts
+        # Unaliased names pass through as-is, not to a default, so upstream still raises
+        # on activations the kernel has no epilogue for.
+        self.config = _FacadeConfig(_ACT_ALIASES.get(act, act))
+
+
+def sonicmoe_experts_forward_with_lora(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Sonicmoe experts forward with PEFT LoRA support.
+
+    Dense bf16 experts use the fast sonic-moe CUTLASS kernel (LoRA materialized
+    into W_eff first). NVFP4 experts, which the opaque CUTLASS kernel cannot
+    read, take the grouped reference path (dequant base + fused low-rank LoRA).
+    On an EP-sharded module expert id ``num_experts`` marks a remote slot.
+    """
+    num_experts_global = getattr(self, "num_experts_global", None)
+    if num_experts_global is not None and num_experts_global > self.num_experts:
+        return _sonicmoe_ep_forward(self, hidden_states, top_k_index, top_k_weights)
+    return _sonicmoe_forward(self, hidden_states, top_k_index, top_k_weights)
+
+
+EP_ROW_PADDING_MODES = ("pow2", "highwater")
+_EP_ROW_PADDING: dict = {"mode": "pow2", "granule": 4096, "headroom": 1.03}
+
+
+def configure_ep_row_padding(
+    mode: str = "pow2", granule: int = 4096, headroom: float = 1.03
+) -> None:
+    if mode not in EP_ROW_PADDING_MODES:
+        raise ValueError(
+            f"sonicmoe_ep_row_padding must be one of {EP_ROW_PADDING_MODES}"
+        )
+    if granule < 1 or headroom < 1:
+        raise ValueError("EP row padding needs granule >= 1 and headroom >= 1")
+    _EP_ROW_PADDING.update(mode=mode, granule=int(granule), headroom=float(headroom))
+    _EP_ROW_MARKS.clear()
+
+
+class _HighWaterMarks:
+    """Padding sizes from a mark that only moves between optimizer steps.
+
+    Within a step every call pads to ``max(frozen mark, its own rounded-up count)`` and only
+    records a pending mark; ``promote`` (at step and evaluation end) folds the pending marks
+    into the frozen ones. A layer's activation-checkpoint recompute therefore gets the same
+    size as its forward, even if a later layer saw more rows in between. One mark per
+    ``module.training`` value, shared by every MoE layer.
+    """
+
+    def __init__(self):
+        self.frozen: dict[bool, int] = {}
+        self.pending: dict[bool, int] = {}
+
+    def size(
+        self,
+        training: bool,
+        count: int,
+        granule: int,
+        cap: int,
+        cap_mark: bool = False,
+    ) -> int:
+        """``cap`` bounds a call's own rounded-up size; ``cap_mark`` also bounds the mark."""
+        frozen = self.frozen.get(training, 0)
+        if count <= frozen:
+            size = min(frozen, cap) if cap_mark else frozen
+        else:
+            wanted = math.ceil(count * _EP_ROW_PADDING["headroom"])
+            size = min(-(-wanted // granule) * granule, cap)
+        if size > self.pending.get(training, 0):
+            self.pending[training] = size
+        return size
+
+    def promote(self) -> None:
+        for training, mark in self.pending.items():
+            self.frozen[training] = max(self.frozen.get(training, 0), mark)
+        self.pending.clear()
+
+    def clear(self) -> None:
+        self.frozen.clear()
+        self.pending.clear()
+
+
+_EP_ROW_MARKS = _HighWaterMarks()
+_EP_PAIR_MARKS = _HighWaterMarks()
+
+
+def seed_ep_padding_marks(rows: int | None = None, pairs: int | None = None) -> None:
+    """Start the training marks at ``rows`` tokens and ``pairs`` pairs, rounded up to their
+    granules, so the first step pads every layer to them instead of to its own count. Never
+    lowers a mark; a step that sees more still raises it."""
+    for count, marks, granule in (
+        (rows, _EP_ROW_MARKS, _EP_ROW_PADDING["granule"]),
+        (pairs, _EP_PAIR_MARKS, _EP_COMPACT["granule"]),
+    ):
+        if count:
+            size = -(-int(count) // granule) * granule
+            marks.frozen[True] = max(marks.frozen.get(True, 0), size)
+
+
+def promote_ep_padding_marks() -> None:
+    """Let the token and pair marks grow to what the last step saw; call between steps."""
+    _EP_ROW_MARKS.promote()
+    _EP_PAIR_MARKS.promote()
+
+
+class EPPaddingMarksCallback(TrainerCallback):
+    """Promote the EP padding marks at step and evaluation boundaries."""
+
+    def on_step_end(self, args, state, control, **kwargs):
+        promote_ep_padding_marks()
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        promote_ep_padding_marks()
+
+
+def ep_padded_rows(num_recv: int, training: bool) -> int:
+    """Tokens to pad an EP-received batch of ``num_recv`` tokens to (never below 1024).
+
+    ``pow2``: the next power of two. ``highwater``: the count times ``headroom`` rounded up
+    to ``granule``, or the largest such size of the previous steps (for this ``training``
+    value) if larger, so shapes stay put across steps and layers without doubling a batch
+    that sits just over a power of two.
+    """
+    pow2 = max(1024, 1 << (num_recv - 1).bit_length()) if num_recv else 1024
+    if _EP_ROW_PADDING["mode"] != "highwater":
+        return pow2
+    # headroom must not push a count at a power of two (EP's per-rank cap) past it
+    size = _EP_ROW_MARKS.size(training, num_recv, _EP_ROW_PADDING["granule"], pow2)
+    return max(size, 1024)
+
+
+_EP_COMPACT: dict = {"enabled": False, "granule": 32768}
+_EP_COMPACT_WARNED: set[str] = set()
+
+
+def configure_ep_compact_routing(enabled: bool = False, granule: int = 32768) -> None:
+    if granule < 1:
+        raise ValueError("sonicmoe_ep_pair_padding_granule must be at least 1")
+    _EP_COMPACT.update(enabled=bool(enabled), granule=int(granule))
+    _EP_PAIR_MARKS.clear()
+
+
+def compact_local_pairs(
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    num_experts: int,
+    training: bool,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flat ``(token_indices, expert_indices, router_scores)`` for the local slots only.
+
+    ``top_k_index`` is the (token-padded) EP grid: ids in ``[0, num_experts)`` are local
+    experts, anything else is a remote slot. The pair count is padded high-water style
+    (``_EP_COMPACT["granule"]``, shared headroom) with sentinel pairs (expert
+    ``num_experts``, score 0) taken from unused slots in token order, so ``token_indices``
+    stays sorted ascending and no token has more than ``k`` pairs. A token with no local
+    expert keeps one sentinel pair, as it has on the full grid, so every token is covered.
+    """
+    num_tokens, k = top_k_index.shape
+    local = (top_k_index >= 0) & (top_k_index < num_experts)
+    has_local = local.any(dim=1)
+    required = local.clone()
+    required[:, 0] |= ~has_local
+    needed = int(required.sum())
+    # pad pairs come from unused grid slots, so the grid size bounds the mark too
+    padded = _EP_PAIR_MARKS.size(
+        training, needed, _EP_COMPACT["granule"], num_tokens * k, cap_mark=True
+    )
+    free = ~required.reshape(-1)
+    chosen = free & (torch.cumsum(free, 0) <= padded - needed)
+    keep = (required.reshape(-1) | chosen).nonzero().squeeze(1)
+    token_indices = torch.arange(
+        num_tokens, device=top_k_index.device, dtype=torch.int32
+    ).repeat_interleave(k)[keep]
+    expert_indices = (
+        torch.where(local, top_k_index, num_experts).reshape(-1)[keep].to(torch.int32)
+    )
+    router_scores = (
+        torch.where(local, top_k_weights, torch.zeros_like(top_k_weights))
+        .reshape(-1)[keep]
+        .to(dtype)
+    )
+    return token_indices, expert_indices, router_scores
+
+
+def _sonicmoe_pairs_forward(
+    facade: "_LoRAExpertsFacade",
+    hidden_states: torch.Tensor,
+    token_indices: torch.Tensor,
+    expert_indices: torch.Tensor,
+    router_scores: torch.Tensor,
+) -> torch.Tensor:
+    """transformers' ``sonicmoe_experts_forward`` with caller-built flat routing."""
+    from transformers.integrations.sonicmoe import ACT_MAP, load_sonicmoe_kernel
+
+    if facade.has_post_expert_norm:
+        raise ValueError(
+            "The `sonicmoe` experts implementation does not support experts with a "
+            "post-expert norm."
+        )
+    act_name = getattr(facade.config, "hidden_act", "silu").lower()
+    if act_name not in ACT_MAP:
+        raise ValueError(
+            f"sonicmoe does not support the {act_name!r} activation; expected one of "
+            f"{sorted(ACT_MAP)}."
+        )
+    perm = (2, 1, 0) if facade.is_transposed else (1, 2, 0)
+    sonicmoe = load_sonicmoe_kernel()
+    output, _ = sonicmoe.moe_general_routing_inputs(
+        hidden_states,
+        router_scores,
+        token_indices,
+        expert_indices,
+        facade.gate_up_proj.permute(*perm),
+        facade.gate_up_proj_bias if facade.has_bias else None,
+        facade.down_proj.permute(*perm),
+        facade.down_proj_bias if facade.has_bias else None,
+        E=facade.num_experts,
+        activation_type=getattr(
+            sonicmoe.activation_type_enum, ACT_MAP[act_name].upper()
+        ),
+        is_inference_mode_enabled=not torch.is_grad_enabled(),
+        concat_layout=facade.is_concatenated,
+        stream_id=None,
+    )
+    return output
+
+
+def _compact_routing_applies(experts_module) -> bool:
+    if not _EP_COMPACT["enabled"]:
+        return False
+    if not getattr(experts_module, "has_gate", True):
+        reason = "non-gated experts"
+    elif getattr(experts_module, "_axolotl_multilora_sonic_forward", None) is not None:
+        reason = "multi-LoRA"
+    elif torch.compiler.is_compiling():
+        reason = "torch.compile (the pair count is data-dependent)"
+    else:
+        return True
+    if reason not in _EP_COMPACT_WARNED:
+        _EP_COMPACT_WARNED.add(reason)
+        from axolotl.utils.logging import get_logger
+
+        get_logger(__name__).warning(
+            "sonicmoe_ep_compact_routing: %s, using the full tokens x top_k grid",
+            reason,
+        )
+    return False
+
+
+def _sonicmoe_ep_forward(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Pad the received rows to a bucket (``ep_padded_rows``, min 1024) with sentinel rows.
+
+    The quack autotuner caches per exact tensor shape and the EP receive count changes
+    every step/layer, so unpadded calls re-trigger a full compile+benchmark sweep per MoE
+    call. All-sentinel rows are zero-compute (dropped from every GEMM range), so shapes
+    collapse to a handful of keys tuned once.
+    """
+    from ..scattermoe_lora.experts import (
+        _get_base_param,
+        _w1_name,
+        is_nvfp4_param,
+        scattermoe_experts_forward_ep,
+    )
+
+    w1 = getattr(self, _w1_name(self), None)
+    w2 = getattr(self, "down_proj", None)
+    if (
+        w1 is not None
+        and w2 is not None
+        and is_nvfp4_param(_get_base_param(w1))
+        and is_nvfp4_param(_get_base_param(w2))
+    ):
+        # the grouped LoRA path whether or not the fake-quant has started: it is the fast
+        # NVFP4 route on Blackwell, where the ScatterMoE fallback would refuse the legacy kernel
+        from ..scattermoe_lora.experts import (
+            _ep_merge_aware_forward,
+            _warn_merge_aware_ep_unsupported,
+        )
+
+        output, unsupported_reason = _ep_merge_aware_forward(
+            self,
+            hidden_states,
+            top_k_index.masked_fill(top_k_index >= self.num_experts, -1),
+            top_k_weights,
+        )
+        if output is not None:
+            return output
+        if unsupported_reason is not None:
+            _warn_merge_aware_ep_unsupported(self, unsupported_reason)
+        return scattermoe_experts_forward_ep(
+            self, hidden_states, top_k_index, top_k_weights
+        )
+
+    num_recv = hidden_states.size(0)
+    padded = ep_padded_rows(num_recv, self.training)
+    if padded != num_recv:
+        pad = padded - num_recv
+        hidden_states = F.pad(hidden_states, (0, 0, 0, pad))
+        top_k_index = F.pad(top_k_index, (0, 0, 0, pad), value=self.num_experts)
+        top_k_weights = F.pad(top_k_weights, (0, 0, 0, pad))
+    pairs = None
+    if _compact_routing_applies(self):
+        pairs = compact_local_pairs(
+            top_k_index,
+            top_k_weights,
+            self.num_experts,
+            self.training,
+            hidden_states.dtype,
+        )
+    out = _sonicmoe_forward(self, hidden_states, top_k_index, top_k_weights, pairs)
+    return out if padded == num_recv else out[:num_recv]
+
+
+def _grid_pairs(
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The flat routing transformers' ``sonicmoe_experts_forward`` builds from the grid."""
+    num_tokens, k = top_k_index.shape
+    token_indices = (
+        torch.arange(num_tokens, device=hidden_states.device, dtype=torch.int32)
+        .unsqueeze(1)
+        .expand(-1, k)
+        .reshape(-1)
+    )
+    return (
+        token_indices,
+        top_k_index.reshape(-1).int(),
+        top_k_weights.reshape(-1).to(hidden_states.dtype),
+    )
+
+
+def _sonicmoe_forward(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """``pairs`` (from ``compact_local_pairs``) replaces the tokens x top_k grid for the dense
+    gated kernel call; every other branch reads the grid, which still describes the routing."""
+    from transformers.integrations.sonicmoe import sonicmoe_experts_forward
+
+    from .nvfp4 import is_nvfp4_param
+
+    has_gate = getattr(self, "has_gate", True)
+    multilora_forward = getattr(self, "_axolotl_multilora_sonic_forward", None)
+    if multilora_forward is not None:
+        return multilora_forward(self, hidden_states, top_k_index, top_k_weights)
+    if hidden_states.device.type != "cuda":
+        raise ValueError("sonicmoe requires CUDA device")
+
+    w1, b1, w2, b2, lora_w1, lora_w2 = _resolve_weights_and_lora(self)
+    if not getattr(self, "has_bias", False):
+        b1 = b2 = None
+
+    # Unwrap FSDP2/EP DTensors to local shards. to_local() is autograd-aware:
+    # backward rewraps the gradient as a DTensor.
+    if isinstance(w1, torch.distributed.tensor.DTensor):
+        w1 = w1.to_local()
+        w2 = w2.to_local()
+        b1 = b1.to_local() if b1 is not None else None
+        b2 = b2.to_local() if b2 is not None else None
+
+    # The opaque CUTLASS kernel cannot read packed FP4, so NVFP4 experts take the
+    # grouped dequant path instead.
+    if is_nvfp4_param(w1) or is_nvfp4_param(w2):
+        return _sonicmoe_nvfp4_forward(
+            self,
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            w1,
+            b1,
+            w2,
+            b2,
+            lora_w1,
+            lora_w2,
+        )
+
+    if (lora_w1 is not None or lora_w2 is not None) and lora_split_applies(
+        self, hidden_states, w1, b1, w2, b2
+    ):
+        facade = _LoRAExpertsFacade(self, w1, b1, w2, b2)
+        if pairs is None:
+            pairs = _grid_pairs(hidden_states, top_k_index, top_k_weights)
+        return sonicmoe_lora_split_forward(
+            facade, hidden_states, *pairs, lora_w1, lora_w2
+        )
+
+    # Materialize W_eff = W + scaling * (B @ A) per expert. No-op when no LoRA.
+    if lora_w1 is not None:
+        w1 = MoELoRAMaterialize.apply(w1, *lora_w1)
+    if lora_w2 is not None:
+        w2 = MoELoRAMaterialize.apply(w2, *lora_w2)
+
+    if not has_gate:
+        return _sonicmoe_nongated_forward(
+            self, hidden_states, top_k_index, top_k_weights, w1, b1, w2, b2
+        )
+
+    facade = _LoRAExpertsFacade(self, w1, b1, w2, b2)
+    if pairs is not None:
+        return _sonicmoe_pairs_forward(facade, hidden_states, *pairs)
+    return sonicmoe_experts_forward(facade, hidden_states, top_k_index, top_k_weights)
+
+
+def _sonicmoe_nongated_forward(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    w1: torch.Tensor,
+    b1,
+    w2: torch.Tensor,
+    b2,
+) -> torch.Tensor:
+    """Non-gated relu² experts (nemotron_h); ``w1``/``w2`` already carry any LoRA delta."""
+    from .nvfp4 import resolve_gated_activation
+
+    act_name = resolve_gated_activation(self.config)
+    if act_name not in ("relu2", "relu_squared"):
+        raise NotImplementedError(
+            f"sonicmoe non-gated experts support only the relu² activation "
+            f"(nemotron_h); got {act_name!r}"
+        )
+    if b1 is not None or b2 is not None:
+        raise NotImplementedError("sonicmoe non-gated experts do not support bias")
+
+    # EP sentinel rows sort past the last segment end here, so their output rows are never
+    # written and the combine would fold uninitialized memory into real tokens.
+    if getattr(self, "num_experts_global", self.num_experts) != self.num_experts:
+        raise NotImplementedError(
+            "sonicmoe non-gated experts do not support expert parallelism yet; "
+            "drop use_sonicmoe (EP wraps any other experts_implementation) or set "
+            "expert_parallel_size: 1"
+        )
+
+    transposed = getattr(self, "is_transposed", False)
+    if os.environ.get("AXOLOTL_SONICMOE_NONGATED_FUSED") == "1":
+        # relu²(h) == h · relu(h), so the duplicated up projection through the REGLU epilogue
+        # is exact and autograd sums both halves' grads back into it. Needs a build allowing reglu.
+        from transformers.integrations.sonicmoe import sonicmoe_experts_forward
+
+        w1 = torch.cat([w1, w1], dim=2 if transposed else 1)
+        return sonicmoe_experts_forward(
+            _LoRAExpertsFacade(self, w1, None, w2, None, act="relu"),
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+        )
+
+    from .nongated import sonicmoe_nongated_forward
+
+    if transposed:
+        w1, w2 = w1.transpose(-2, -1), w2.transpose(-2, -1)
+    return sonicmoe_nongated_forward(
+        hidden_states, top_k_index, top_k_weights, w1, w2, self.num_experts
+    )
+
+
+def _select_nvfp4_backend(w1, w2) -> str:
+    """``fp4_cute`` (SM100 in-kernel W4A4) when available and dims align, else
+    ``dequant``. ``AXOLOTL_SONICMOE_NVFP4_BACKEND`` forces a backend."""
+    override = os.environ.get("AXOLOTL_SONICMOE_NVFP4_BACKEND")
+    if override:
+        return override
+
+    from .fp4_cute import fp4_cute_available
+    from .fp4_cute_ops import fp4_cute_dims_ok
+    from .nvfp4 import is_nvfp4_param
+
+    if (
+        is_nvfp4_param(w1)
+        and is_nvfp4_param(w2)
+        and fp4_cute_available()
+        and fp4_cute_dims_ok(w1, w2)
+    ):
+        return "fp4_cute"
+    return "dequant"
+
+
+def _sonicmoe_nvfp4_forward(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    w1: torch.Tensor,
+    b1,
+    w2: torch.Tensor,
+    b2,
+    lora_w1,
+    lora_w2,
+) -> torch.Tensor:
+    """NVFP4 experts forward via the grouped path (base frozen).
+
+    LoRA is applied as a fused low-rank delta at the grouped-token level (no
+    base-weight gradient). On SM100/SM110 the base stays packed and runs the
+    in-kernel W4A4 grouped GEMM (``fp4_cute``); elsewhere it is dequantized to
+    dense per matmul (``dequant``).
+    """
+    from .epilogue import check_epilogue
+    from .nvfp4 import resolve_gated_activation
+    from .nvfp4_lora import grouped_moe_reference_forward
+
+    if getattr(self, "is_transposed", False):
+        raise NotImplementedError(
+            "sonicmoe NVFP4 path supports the [E, 2*I, H] / [E, H, I] layout only "
+            "(is_transposed=False)"
+        )
+
+    # Expert parallelism is not finished for this path: the base is EP-sharded to
+    # local experts while routing/LoRA still use global expert ids, and the local
+    # token dispatch is not implemented. Fail loudly instead of computing garbage.
+    if getattr(self, "num_experts_global", self.num_experts) != self.num_experts:
+        raise NotImplementedError(
+            "sonicmoe NVFP4 path does not support expert parallelism yet "
+            "(EP-sharded base with global-id routing/LoRA is unfinished and untested)"
+        )
+
+    act = resolve_gated_activation(self.config)
+    limit = getattr(self, "limit", None)
+    concat = getattr(self, "is_concatenated", True)
+    if not getattr(self, "has_gate", True):
+        # `_apply_gate` is not the contract for non-gated experts, so check `act` directly.
+        if act not in ("relu2", "relu_squared"):
+            raise NotImplementedError(
+                f"sonicmoe non-gated NVFP4 experts support only the relu² activation "
+                f"(nemotron_h); got {act!r}"
+            )
+    else:
+        # `gated_activation` honors `limit`, so this path additionally accepts clamped SwiGLU.
+        check_epilogue(self, act, concat=concat, limit=limit, path="NVFP4 grouped")
+
+    lora1 = (lora_w1[0], lora_w1[1]) if lora_w1 is not None else None
+    lora2 = (lora_w2[0], lora_w2[1]) if lora_w2 is not None else None
+    scaling1 = lora_w1[2] if lora_w1 is not None else 1.0
+    scaling2 = lora_w2[2] if lora_w2 is not None else 1.0
+
+    return grouped_moe_reference_forward(
+        hidden_states,
+        top_k_index,
+        top_k_weights,
+        w1,
+        b1,
+        w2,
+        b2,
+        lora1,
+        lora2,
+        self.num_experts,
+        act=act,
+        backend=_select_nvfp4_backend(w1, w2),
+        limit=limit,
+        concat=concat,
+        scaling1=scaling1,
+        scaling2=scaling2,
+        gated=getattr(self, "has_gate", True),
+    )
+
+
+def register_sonicmoe_experts() -> None:
+    """Register the LoRA-aware ``"sonicmoe"`` forward, overriding upstream. Idempotent."""
+    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+
+    ALL_EXPERTS_FUNCTIONS.register("sonicmoe", sonicmoe_experts_forward_with_lora)
+
+    # Route PEFT target_parameters expert LoRA past the parametrization merge (which cannot
+    # run on quantized bases) to the fused low-rank path.
+    try:
+        from .experts_lora_fastpath import patch_paramwrapper_sonicmoe_fastpath
+
+        patch_paramwrapper_sonicmoe_fastpath()
+    except (ImportError, AttributeError):
+        pass
+
+    from ..scattermoe_lora.nvfp4_fsdp import patch_nvfp4_fsdp
+
+    patch_nvfp4_fsdp()
+
+
+# Re-export utilities for tests / external callers.
+__all__ = [
+    "sonicmoe_experts_forward_with_lora",
+    "register_sonicmoe_experts",
+    "materialize_expert_lora",
+]

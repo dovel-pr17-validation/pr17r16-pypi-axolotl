@@ -1,0 +1,636 @@
+"""Module for working with config dicts"""
+
+import copy
+import json
+import os
+from typing import Optional
+
+import torch
+from packaging.version import Version
+from pydantic import ValidationError
+from pydantic_core import PydanticUndefined, PydanticUndefinedType
+from transformers.utils import is_torch_bf16_gpu_available
+from transformers.utils.import_utils import (
+    is_torch_npu_available,
+)
+
+from axolotl.integrations.config import merge_input_args
+from axolotl.loaders.constants import MULTIMODAL_AUTO_MODEL_MAPPING
+from axolotl.loaders.utils import load_model_config
+from axolotl.model_support import (
+    DiffusionLayout,
+    ModelHookContext,
+    ModelHookPhase,
+    Supported,
+    Unsupported,
+    get_model_support,
+    is_native_diffusion,
+    resolve_model_support,
+    run_model_support_hooks,
+)
+from axolotl.utils.bench import log_gpu_memory_usage
+from axolotl.utils.dict import DictDefault
+from axolotl.utils.logging import get_logger
+from axolotl.utils.schemas.datasets import (
+    DPODataset,
+    KTODataset,
+    SFTDataset,
+    SyntheticDataset,
+)
+from axolotl.utils.schemas.utils import is_deepspeed_zero3_config
+
+LOG = get_logger(__name__)
+
+_NONE_DEFAULT_FIELDS = {
+    "xformers_attention",
+    "sdp_attention",
+    "flex_attention",
+    "flash_attention",
+    "sage_attention",
+    "eager_attention",
+}
+
+
+def _is_pydantic_undefined(value):
+    return value is PydanticUndefined or isinstance(value, PydanticUndefinedType)
+
+
+def _field_name_for_missing_loc(model_cls, field_loc):
+    fields = getattr(model_cls, "model_fields", None) or {}
+    if field_loc in fields:
+        return field_loc
+
+    for field_name, field in fields.items():
+        if field_loc == getattr(field, "alias", None):
+            return field_name
+
+        validation_alias = getattr(field, "validation_alias", None)
+        if field_loc == validation_alias:
+            return field_name
+
+        for alias in getattr(validation_alias, "choices", ()) or ():
+            if field_loc == alias:
+                return field_name
+
+        alias_path = getattr(validation_alias, "path", None)
+        if alias_path and field_loc == alias_path[0]:
+            return field_name
+
+    return field_loc
+
+
+def _field_default_from_mro(model_cls, field_name):
+    if field_name in _NONE_DEFAULT_FIELDS:
+        return None
+
+    for cls in model_cls.__mro__:
+        fields = getattr(cls, "model_fields", None)
+        if not fields or field_name not in fields:
+            continue
+
+        default = fields[field_name].get_default(call_default_factory=True)
+        if not _is_pydantic_undefined(default):
+            return copy.deepcopy(default)
+
+    return PydanticUndefined
+
+
+def _model_validate_with_field_names(model_cls, data):
+    try:
+        return model_cls.model_validate(data, by_alias=True, by_name=True)
+    except TypeError:
+        return model_cls(**data)
+
+
+def _model_with_inherited_default_fallback(model_cls, data):
+    try:
+        return model_cls(**data)
+    except ValidationError as exc:
+        missing_fields = {
+            _field_name_for_missing_loc(model_cls, err["loc"][0])
+            for err in exc.errors()
+            if err.get("type") == "missing" and len(err.get("loc", ())) == 1
+        }
+        if not missing_fields:
+            raise
+
+        data_with_defaults = dict(data)
+        for field_name in missing_fields:
+            if field_name in data_with_defaults:
+                continue
+            default = _field_default_from_mro(model_cls, field_name)
+            if _is_pydantic_undefined(default):
+                raise
+            data_with_defaults[field_name] = default
+
+        return _model_validate_with_field_names(model_cls, data_with_defaults)
+
+
+def choose_device(cfg):
+    def get_device():
+        try:
+            if torch.cuda.is_available():
+                return f"cuda:{cfg.local_rank}"
+
+            if torch.backends.mps.is_available():
+                return "mps"
+
+            if is_torch_npu_available():
+                return f"npu:{cfg.local_rank}"
+
+            raise SystemError("No CUDA/mps/npu device found")
+        except Exception:
+            return "cpu"
+
+    cfg.device = get_device()
+    if cfg.world_size == 1:
+        cfg.device_map = cfg.device_map or "auto"
+    else:
+        if cfg.device.startswith("cuda"):
+            cfg.device_map = {"": torch.cuda.current_device()}
+        elif cfg.device.startswith("npu"):
+            cfg.device_map = {"npu": torch.npu.current_device()}
+        else:
+            cfg.device_map = {"": cfg.device}
+
+    # in `accelerate launch`, we need to not pass through any device map and let
+    # accelerate figure out which parts of the model to put on which gpu
+    accelerate_vars = [var for var in os.environ if var.startswith("ACCELERATE_USE_")]
+    if accelerate_vars:
+        cfg.device_map = None
+
+
+def resolve_dtype(cfg):
+    if (
+        not cfg.fp16 and cfg.bf16 == "auto" and not cfg.use_ray
+    ):  # if we use ray we want to defer this check to the worker node
+        if is_torch_bf16_gpu_available():
+            LOG.debug("bf16 support detected, enabling for this configuration.")
+            cfg.bf16 = True
+        else:
+            LOG.debug("bf16 support not detected, disabling for this configuration.")
+            cfg.bf16 = False
+            if cfg.fp16 is None and not cfg.float16:
+                cfg.fp16 = True
+
+    if cfg.fp16 and cfg.bf16 == "auto":
+        cfg.bf16 = False
+
+    if cfg.device == "mps":
+        cfg.load_in_8bit = False
+        cfg.tf32 = False
+        if cfg.bf16 and cfg.fp16 is not False:
+            cfg.fp16 = True
+        cfg.bf16 = False
+    else:
+        if cfg.tf32 is True:
+            torch.set_float32_matmul_precision("high")
+            torch.backends.fp32_precision = "tf32"
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+            torch.backends.cudnn.fp32_precision = "tf32"
+        if cfg.bf16:
+            cfg.fp16 = False
+
+    if cfg.bf16 or cfg.bfloat16:
+        cfg.torch_dtype = torch.bfloat16
+    elif cfg.load_in_8bit or cfg.fp16 or cfg.float16:
+        cfg.torch_dtype = torch.float16
+    else:
+        cfg.torch_dtype = torch.float32
+
+
+_LEGACY_DIFFUSION_PLUGINS = frozenset(
+    {
+        "axolotl.integrations.diffusion.DiffusionPlugin",
+        "axolotl.integrations.diffusion.plugin.DiffusionPlugin",
+    }
+)
+
+
+def _validate_diffusion_lm_target(cfg, resolved_support) -> None:
+    from axolotl.integrations.base import normalize_plugin_name
+
+    if is_native_diffusion(cfg):
+        if resolved_support is None or resolved_support.diffusion is None:
+            raise ValueError(
+                f"`diffusion_lm` is set but model type {cfg.model_config_type!r} "
+                "has no native diffusion profile, so training would silently fall "
+                "back to causal SFT. Use a native diffusion checkpoint, or convert "
+                "a causal checkpoint with `diffusion_lm.from_causal_lm: true` and "
+                "`plugins: [axolotl.integrations.diffusion.DiffusionPlugin]`."
+            )
+        return
+    plugins = {normalize_plugin_name(name) for name in cfg.plugins or []}
+    if not plugins & _LEGACY_DIFFUSION_PLUGINS:
+        raise ValueError(
+            "`diffusion_lm.from_causal_lm: true` requires "
+            "`plugins: [axolotl.integrations.diffusion.DiffusionPlugin]`; without "
+            "it training would silently fall back to causal SFT."
+        )
+
+
+def normalize_config(cfg):
+    # setup some derived config / hyperparams
+    if not cfg.use_ray:
+        cfg.gradient_accumulation_steps = cfg.gradient_accumulation_steps or (
+            cfg.batch_size // cfg.micro_batch_size
+        )
+        cfg.batch_size = (
+            cfg.batch_size or cfg.micro_batch_size * cfg.gradient_accumulation_steps
+        )
+    if cfg.eval_batch_size is None:
+        cfg.eval_batch_size = cfg.micro_batch_size
+    cfg.world_size = int(os.environ.get("WORLD_SIZE", 1))
+    cfg.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    cfg.eval_table_size = cfg.eval_table_size or 0
+    cfg.eval_max_new_tokens = cfg.eval_max_new_tokens or 128
+    cfg.eval_causal_lm_metrics = cfg.eval_causal_lm_metrics or [
+        "sacrebleu",
+        "comet",
+        "ter",
+        "chrf",
+    ]
+    choose_device(cfg)
+    cfg.ddp = cfg.ddp if cfg.ddp is not None else cfg.world_size != 1
+    if cfg.world_size != 1:
+        cfg.device_map = {"": int(os.environ.get("LOCAL_RANK", 0))}
+        if cfg.fsdp or cfg.fsdp_config or cfg.ddp:
+            effective_world_size = (
+                cfg.world_size
+                // (cfg.context_parallel_size or 1)
+                // (cfg.tensor_parallel_size or 1)
+            )
+            cfg.batch_size = cfg.batch_size * effective_world_size
+
+    if not cfg.use_ray:
+        # delay resolving dtype until on worker node when launching with ray
+        resolve_dtype(cfg)
+
+    if cfg.deepspeed:
+        if isinstance(cfg.deepspeed, str) and os.path.exists(cfg.deepspeed):
+            ds_config_path = cfg.deepspeed
+            with open(ds_config_path, encoding="utf-8") as f:
+                cfg.deepspeed = json.load(f)
+
+    if cfg.saves_per_epoch:
+        save_steps = 1.0 / (cfg.saves_per_epoch * cfg.num_epochs)
+        if save_steps < 1.0:  # prevent saves on every step
+            cfg.save_steps = save_steps
+        elif save_steps > 1:
+            LOG.warning(
+                f"Invalid value for save_steps ({save_steps}) from saves_per_epoch and/or num_epochs. Saving at training end only."
+            )
+    if (cfg.val_set_size or cfg.test_datasets) and cfg.evals_per_epoch:
+        eval_steps = 1.0 / (cfg.evals_per_epoch * cfg.num_epochs)
+        if eval_steps < 1.0:  # prevent evals on every step
+            cfg.eval_steps = eval_steps
+        elif eval_steps > 1:
+            LOG.warning(
+                f"Invalid value for eval_steps ({eval_steps}) from evals_per_epoch and/or num_epochs. Skipping evaluations."
+            )
+
+    if not cfg.base_model_config:
+        cfg.base_model_config = cfg.base_model
+
+    # Apply pre-config load patches (e.g., for Kimi Linear remote code patching)
+    from axolotl.loaders.patch_manager import PatchManager
+    from axolotl.monkeypatch.models.recurrent_support import (
+        validate_recurrent_model_config,
+    )
+
+    PatchManager.apply_pre_config_load_patches(cfg)
+
+    model_config = load_model_config(cfg)
+
+    cfg.tokenizer_config = (
+        cfg.tokenizer_config or cfg.base_model_config or cfg.base_model
+    )
+
+    model_support = get_model_support(getattr(model_config, "model_type", None))
+    resolved_support = (
+        resolve_model_support(model_support) if model_support is not None else None
+    )
+
+    cfg.model_config_type = model_config.model_type
+    validate_recurrent_model_config(cfg)
+
+    native_text_diffusion = (
+        resolved_support is not None
+        and resolved_support.family == "diffusion_lm"
+        and not resolved_support.is_multimodal
+    )
+    native_diffusion = native_text_diffusion and is_native_diffusion(cfg)
+    if native_diffusion and cfg.attn_implementation is None:
+        cfg.attn_implementation = "flex_attention"
+    if cfg.attn_implementation == "varlen":
+        varlen_supported = (
+            native_diffusion
+            and resolved_support is not None
+            and resolved_support.diffusion is not None
+            and resolved_support.diffusion.layout is DiffusionLayout.FULL_SEQUENCE
+            and isinstance(
+                resolved_support.capabilities.get("diffusion_varlen"), Supported
+            )
+        )
+        if not varlen_supported:
+            raise ValueError(
+                "attn_implementation: varlen is supported only for native "
+                "full-sequence diffusion models that declare diffusion_varlen."
+            )
+        env_capabilities = getattr(cfg, "env_capabilities", None)
+        configured_torch_version = (
+            env_capabilities.get("torch_version")
+            if isinstance(env_capabilities, dict)
+            else getattr(env_capabilities, "torch_version", None)
+        )
+        torch_version = configured_torch_version or torch.__version__
+        if Version(str(torch_version).split("+", maxsplit=1)[0]) < Version("2.14.0"):
+            raise ValueError(
+                "attn_implementation: varlen requires torch >= 2.14 for its "
+                "public GQA API."
+            )
+    if cfg.diffusion_lm is not None:
+        _validate_diffusion_lm_target(cfg, resolved_support)
+    if native_text_diffusion and cfg.is_multimodal:
+        raise ValueError(
+            "Native text-only diffusion models do not support multimodal processing"
+        )
+    cfg.is_multimodal = (
+        False
+        if native_text_diffusion
+        else (
+            (resolved_support is not None and resolved_support.is_multimodal)
+            or hasattr(model_config, "model_type")
+            and model_config.model_type in MULTIMODAL_AUTO_MODEL_MAPPING
+            or any(
+                multimodal_name in cfg.base_model.lower()
+                for multimodal_name in [
+                    "pixtral",
+                ]
+            )
+            or cfg.is_multimodal
+        )
+    )
+    if cfg.is_multimodal:
+        cfg.processor_config = (
+            cfg.processor_config or cfg.base_model_config or cfg.base_model
+        )
+
+    if resolved_support is not None:
+        # The auto-enable validator runs before model_type is known; undo it
+        # for archs that declare the fused kernels broken.
+        lora_kernels_cap = resolved_support.capabilities.get("lora_kernels")
+        kernel_fields = (
+            "lora_mlp_kernel",
+            "lora_qkv_kernel",
+            "lora_o_kernel",
+            "lora_embedding_kernel",
+        )
+        if isinstance(lora_kernels_cap, Unsupported) and any(
+            cfg[k] for k in kernel_fields
+        ):
+            LOG.warning(
+                "Disabling fused LoRA kernels: unsupported for model_type=%s.%s",
+                cfg.model_config_type,
+                f" {lora_kernels_cap.reason}" if lora_kernels_cap.reason else "",
+            )
+            for k in kernel_fields:
+                cfg[k] = False
+
+    run_model_support_hooks(
+        model_support,
+        ModelHookPhase.CONFIGURE_RUN,
+        ModelHookContext(
+            cfg=cfg,
+            model_config=model_config,
+            inference=cfg.inference,
+        ),
+    )
+
+    # Resolve inner text backbone type for VLM wrappers (e.g. mistral3 -> mistral4)
+    if callable(getattr(model_config, "get_text_config", None)):
+        text_config = model_config.get_text_config()
+        if (
+            hasattr(text_config, "model_type")
+            and text_config.model_type != model_config.model_type
+        ):
+            cfg.model_config_type_text = text_config.model_type
+
+    # figure out if the model is llama
+    cfg.is_llama_derived_model = (
+        (
+            hasattr(model_config, "model_type")
+            and model_config.model_type in ["llama", "mllama_text_model"]
+        )
+        or cfg.is_llama_derived_model
+        or "llama" in cfg.base_model.lower()
+        or (cfg.type_of_model and "llama" in cfg.type_of_model.lower())
+    )
+
+    # figure out if the model is falcon
+    cfg.is_falcon_derived_model = (
+        (
+            hasattr(model_config, "model_type")
+            and model_config.model_type
+            in [
+                "falcon",
+                "RefinedWebModel",
+                "RefinedWeb",
+            ]
+        )
+        or cfg.is_falcon_derived_model
+        or "falcon" in cfg.base_model.lower()
+        or (cfg.type_of_model and "rwforcausallm" in cfg.type_of_model.lower())
+    )
+
+    cfg.is_mistral_derived_model = (
+        (
+            hasattr(model_config, "model_type")
+            and model_config.model_type
+            in [
+                "mistral",
+            ]
+        )
+        or cfg.is_mistral_derived_model
+        or "mistral" in cfg.base_model.lower().split("/")[-1]
+        or (cfg.type_of_model and "mistral" in cfg.type_of_model.lower())
+    )
+
+    cfg.is_qwen_derived_model = (
+        hasattr(model_config, "model_type")
+        and model_config.model_type
+        in [
+            "qwen",
+        ]
+    ) or cfg.is_qwen_derived_model
+
+    if isinstance(cfg.pretraining_dataset, dict):
+        cfg.pretraining_dataset = [cfg.pretraining_dataset]
+
+    if (
+        cfg.gradient_checkpointing
+        and cfg.unfrozen_parameters is None
+        and cfg.rl is None
+        and "use_reentrant" not in (cfg.gradient_checkpointing_kwargs or {})
+    ):
+        # Non-reentrant is PyTorch's recommended default. DeepSpeed ZeRO-3 keeps
+        # reentrant: non-reentrant recompute sees the partitioned parameters and
+        # raises a CheckpointError. Other checkpoint kwargs the user set are kept.
+        cfg.gradient_checkpointing_kwargs = {
+            **(cfg.gradient_checkpointing_kwargs or {}),
+            "use_reentrant": is_deepspeed_zero3_config(cfg.deepspeed)
+            or os.getenv("ACCELERATE_DEEPSPEED_ZERO_STAGE") == "3",
+        }
+
+    # Gemma4 requires use_reentrant=False for DDP (shared per-layer norms /
+    # cross-layer shared KV cause "marked ready twice" errors with reentrant
+    # checkpointing) and ddp_find_unused_parameters=True (per_layer_projection
+    # LoRA / frozen mm params may not receive gradients on every step). The
+    # unified variant shares the same constraints.
+    if cfg.model_config_type in ("gemma4", "gemma4_unified"):
+        if cfg.gradient_checkpointing:
+            if cfg.gradient_checkpointing_kwargs is None:
+                cfg.gradient_checkpointing_kwargs = {}
+            if cfg.gradient_checkpointing_kwargs.get("use_reentrant") is not False:
+                LOG.warning(
+                    "Gemma4 requires use_reentrant=False for gradient checkpointing "
+                    "in distributed training. Setting use_reentrant=False."
+                )
+                cfg.gradient_checkpointing_kwargs["use_reentrant"] = False
+        if cfg.ddp and cfg.ddp_find_unused_parameters is None:
+            if cfg.activation_offloading is True:
+                # activation_offloading uses checkpoint wrappers that conflict
+                # with find_unused_parameters (causes "marked ready twice").
+                # Use freeze_mm_modules instead to eliminate unused params.
+                LOG.info(
+                    "Gemma4 + DDP + activation_offloading: skipping "
+                    "ddp_find_unused_parameters (use freeze_mm_modules to "
+                    "handle unused vision/audio params)."
+                )
+            else:
+                LOG.warning(
+                    "Gemma4 requires ddp_find_unused_parameters=True for DDP. "
+                    "Auto-enabling."
+                )
+                cfg.ddp_find_unused_parameters = True
+
+    # MixLoRA reads _aux_loss from the module after the forward pass; reentrant
+    # checkpointing recomputes forward under no_grad, dropping the autograd graph.
+    if cfg.adapter == "mixlora" and cfg.gradient_checkpointing:
+        if cfg.gradient_checkpointing_kwargs is None:
+            cfg.gradient_checkpointing_kwargs = {}
+        if cfg.gradient_checkpointing_kwargs.get("use_reentrant") is not False:
+            cfg.gradient_checkpointing_kwargs["use_reentrant"] = False
+
+    log_gpu_memory_usage(LOG, "baseline", cfg.device)
+
+
+def normalize_cfg_datasets(cfg):
+    """
+    helpers for mapping chat_template to various dataset configurations as necessary
+    """
+
+    if cfg.chat_template:
+        if cfg.datasets:
+            for idx, ds_cfg in enumerate(cfg.datasets):
+                if (
+                    ds_cfg.type in ["orpo.chat_template", "chat_template"]
+                    and not ds_cfg.chat_template
+                ):
+                    LOG.info(
+                        f"updating dataset {ds_cfg.path} with `chat_template: {cfg.chat_template}` to match your chat_template"
+                    )
+                    cfg.datasets[idx].chat_template = cfg.chat_template
+                    cfg.datasets[idx].chat_template_jinja = cfg.chat_template_jinja
+
+
+def validate_config(
+    cfg: DictDefault,
+    capabilities: Optional[dict] = None,
+    env_capabilities: Optional[dict] = None,
+) -> DictDefault:
+    from axolotl.integrations.base import get_builtin_plugins
+    from axolotl.utils.schemas import config as config_schema
+
+    if cfg.plugins or get_builtin_plugins():
+        AxolotlConfigWCapabilities, AxolotlInputConfig = merge_input_args()
+    else:
+        AxolotlConfigWCapabilities = config_schema.AxolotlConfigWCapabilities
+        AxolotlInputConfig = config_schema.AxolotlInputConfig
+
+    # Convert datasets to proper format if needed
+    if cfg.get("datasets"):
+        for idx, ds_cfg in enumerate(cfg["datasets"]):
+            if cfg.get("rl") in ["dpo", "ipo", "simpo"] and not isinstance(
+                ds_cfg, DPODataset
+            ):
+                cfg["datasets"][idx] = DPODataset(**ds_cfg)
+            elif cfg.get("rl") == "kto" and not isinstance(ds_cfg, KTODataset):
+                cfg["datasets"][idx] = KTODataset(**dict(ds_cfg))
+            elif (
+                ds_cfg.get("type")
+                if isinstance(ds_cfg, dict)
+                else getattr(ds_cfg, "type", None)
+            ) == "_synthetic" and not isinstance(ds_cfg, SyntheticDataset):
+                cfg["datasets"][idx] = SyntheticDataset(
+                    **(ds_cfg if isinstance(ds_cfg, dict) else dict(ds_cfg))
+                )
+            elif not isinstance(ds_cfg, SFTDataset):
+                cfg["datasets"][idx] = SFTDataset(**dict(ds_cfg))
+
+    if capabilities or env_capabilities:
+        if (capabilities and env_capabilities is None) or (
+            env_capabilities and capabilities is None
+        ):
+            raise ValueError(
+                "Both capabilities and env_capabilities must be provided or not provided."
+            )
+
+        return DictDefault(
+            dict(
+                _model_with_inherited_default_fallback(
+                    AxolotlConfigWCapabilities,
+                    {
+                        **cfg.to_dict(),
+                        "capabilities": capabilities,
+                        "env_capabilities": env_capabilities,
+                    },
+                ).model_dump(exclude_none=True)
+            )
+        )
+
+    return DictDefault(
+        dict(
+            _model_with_inherited_default_fallback(
+                AxolotlInputConfig, cfg.to_dict()
+            ).model_dump(exclude_none=True)
+        )
+    )
+
+
+def prepare_plugins(cfg):
+    """Prepare installed plugins and plugins explicitly selected by the config."""
+    from axolotl.integrations.base import (
+        PluginManager,
+        get_builtin_plugins,
+        normalize_plugin_name,
+    )
+
+    builtin_plugins = get_builtin_plugins()
+    configured_plugins = tuple(
+        dict.fromkeys(
+            normalize_plugin_name(plugin_name)
+            for plugin_name in cfg.get("plugins") or []
+        )
+    )
+
+    if not configured_plugins and not builtin_plugins:
+        return
+
+    plugin_manager = PluginManager.get_instance()
+    for plugin_name in configured_plugins:
+        if plugin_name not in plugin_manager.plugins:
+            plugin_manager.register(plugin_name, required=True)
+    for plugin_name in dict.fromkeys((*builtin_plugins, *configured_plugins)):
+        if plugin_name in plugin_manager.plugins:
+            plugin_manager.plugins[plugin_name].register(cfg)

@@ -1,0 +1,66 @@
+codecov:
+  require_ci_to_pass: yes
+  notify:
+    wait_for_ci: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "70...100"
+  status:
+    project:
+      default:
+        # basic
+        target: auto
+        threshold: 1%
+        base: auto
+        # advanced
+        branches: null
+        if_no_uploads: error
+        if_not_found: success
+        if_ci_failed: error
+        only_pulls: true
+        flags: null
+        paths: null
+        informational: true
+    patch:
+      default:
+        # basic
+        target: auto
+        threshold: 1%
+        base: auto
+        # advanced
+        branches: null
+        if_no_uploads: error
+        if_not_found: success
+        if_ci_failed: error
+        only_pulls: false
+        flags: null
+        paths: null
+        informational: true
+
+# Carried forward per flag when a commit has no upload for it, so a run where only the
+# testmon or selected arms execute keeps the last full-suite report instead of dropping
+# the flag. Those arms must never upload under the full suites' flags: any upload for a
+# flag replaces the carried report, so a partial run would become the number.
+flag_management:
+  default_rules:
+    carryforward: true
+
+parsers:
+  gcov:
+    branch_detection:
+      conditional: yes
+      loop: yes
+      method: no
+      macro: no
+
+comment:
+  layout: "reach,diff,flags,files,footer"
+  behavior: default
+  require_changes: no
+  require_base: no
+  require_head: yes
+
+github_checks:
+  annotations: false

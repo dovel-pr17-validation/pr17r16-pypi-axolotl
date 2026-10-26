@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+ARG CUDA_VERSION="13.0.3"
+ARG CUDNN_VERSION=""
+ARG UBUNTU_VERSION="24.04"
+ARG MAX_JOBS=4
+ARG TARGETARCH
+
+FROM nvidia/cuda:$CUDA_VERSION-cudnn$CUDNN_VERSION-devel-ubuntu$UBUNTU_VERSION AS base-builder
+
+ARG TARGETARCH
+ARG PYTHON_VERSION="3.14"
+ARG PYTORCH_VERSION="2.14.1"
+ARG CUDA="130"
+ARG TORCH_BACKEND="cu130"
+ARG TORCH_INDEX_URL=""
+ARG TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3 12.0+PTX"
+
+ENV PYTHON_VERSION=$PYTHON_VERSION
+ENV TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST
+
+RUN apt-get update \
+    && apt-get install -y ca-certificates wget git build-essential ninja-build git-lfs libaio-dev pkg-config curl \
+    && apt-get install -y --allow-change-held-packages vim curl nano zstd libnccl2 libnccl-dev ibverbs-providers ibverbs-utils infiniband-diags librdmacm-dev librdmacm1 rdmacm-utils slurm-wlm rsync s3fs \
+    && rm -rf /var/cache/apt/archives \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install --skip-repo \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh
+
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN uv python install ${PYTHON_VERSION}
+
+WORKDIR /workspace
+
+RUN uv venv --no-project --relocatable axolotl-venv
+
+ENV PATH="/workspace/axolotl-venv/bin:${PATH}"
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -e; \
+    NV_BACKEND="${TORCH_BACKEND%?}"; \
+    CUTLASS_DSL="nvidia-cutlass-dsl"; \
+    if [ "$NV_BACKEND" = "cu13" ]; then \
+        CUTLASS_DSL="${CUTLASS_DSL}[cu13]"; \
+    fi; \
+    uv pip install packaging setuptools wheel psutil; \
+    if [ -n "$TORCH_INDEX_URL" ]; then \
+        uv pip install --extra-index-url "$TORCH_INDEX_URL" \
+            torch==${PYTORCH_VERSION} apache-tvm-ffi torchvision \
+            "${CUTLASS_DSL}" nvidia-nvshmem-${NV_BACKEND}; \
+    else \
+        UV_TORCH_BACKEND=$TORCH_BACKEND uv pip install \
+            torch==${PYTORCH_VERSION} apache-tvm-ffi torchvision \
+            "${CUTLASS_DSL}" nvidia-nvshmem-${NV_BACKEND}; \
+    fi; \
+    uv pip install awscli pydantic
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        MAMBA_SKIP_CUDA_BUILD=TRUE CAUSAL_CONV1D_SKIP_CUDA_BUILD=TRUE uv pip install --no-build-isolation mamba_ssm causal_conv1d; \
+    fi

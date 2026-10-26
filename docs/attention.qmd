@@ -1,0 +1,281 @@
+---
+title: Attention
+description: Supported attention modules in Axolotl
+---
+
+Axolotl routes attention via a single config field:
+
+```yaml
+attn_implementation: <backend>
+```
+
+`attn_implementation` is passed through to `transformers` verbatim (via
+`model.config._attn_implementation`). Accepted values are the HF-native
+backends, axolotl-registered backends, or a hub-kernel path.
+
+## Backends
+
+| `attn_implementation` | Description |
+|---|---|
+| `eager` | Plain PyTorch attention. No packing support. |
+| `sdpa` | PyTorch `scaled_dot_product_attention`. No packing support. |
+| `flash_attention_2` | Dao-AILab Flash Attention 2. |
+| `flash_attention_3` | Dao-AILab Flash Attention 3 (Hopper+). |
+| `flash_attention_4` | Dao-AILab Flash Attention 4 (Hopper+, `flash_attn.cute`). |
+| `flash_attention_torch` | Torch in-tree varlen attention (`torch.nn.attention.varlen`, torch ≥ 2.11, CUDA only). No `flash_attn` dependency. No dropout, attention sinks, or softcap. |
+| `flex_attention` | Torch Flex Attention (requires torch ≥ 2.6). |
+| `varlen` | Torch public varlen attention for native full-sequence diffusion models (Nemotron diffusion) only; requires torch ≥ 2.14. See [diffusion_lm](diffusion_lm.qmd#attention-backends). |
+| `xformers` | xFormers memory-efficient attention. |
+| `sage` | SageAttention (QK int8 / PV fp16). |
+| `s2` | Shifted-Sparse Attention (LLaMA only, FA2 under the hood). |
+| `fp8` | torchao FP8 low-precision attention (requires SM90+, torch ≥ 2.11). Loaded as SDPA and patched post-load. |
+| `kernels-community/flash-attn3` | HF hub FA3 kernel. |
+| `kernels-community/sage-attention` | HF hub SageAttention kernel. |
+| Other `<org>/<name>` path | Any hub-kernel path supported by `transformers`. |
+
+Short-form aliases (`flash`, `fa2`, `flex`, `sdp`, etc.) are **not accepted** —
+set the canonical name above.
+
+### Capability flags
+
+Axolotl derives three boolean capability flags from `attn_implementation` and
+exposes them on the validated config:
+
+- `cfg.attn_supports_packing` — backend supports varlen sample packing via
+  `position_ids`. Gates multipack patches and `sample_packing_drop_attention_mask`.
+- `cfg.attn_uses_flash_lib` — backend needs the `flash_attn` (Dao-AILab)
+  monkeypatches (FA4 auto, LLaMA flash hijack, ring-FA).
+- `cfg.attn_needs_dtype_cast` — backend requires fp16/bf16 embeddings
+  (everything except `eager` and `sdpa`).
+
+These are **computed** — they cannot be overridden from YAML.
+
+## Per-backend notes
+
+### SDPA
+
+Default PyTorch attention. See
+[PyTorch docs](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html).
+
+```yaml
+attn_implementation: sdpa
+```
+
+### Flash Attention
+
+Axolotl supports FA2, FA3, and FA4. None of them needs a `flash_attn` package any
+more: when the Dao-AILab package is absent, `transformers` resolves the backend to
+a prebuilt kernel from the Hugging Face Hub through the `kernels` library, matched
+to your torch, CUDA and GPU. `import flash_attn` failing therefore does not mean
+flash attention is unavailable.
+
+```yaml
+attn_implementation: flash_attention_2  # or flash_attention_3 / flash_attention_4
+```
+
+| Backend | Hub kernel used when the package is absent | Notes |
+|---|---|---|
+| `flash_attention_2` | `kernels-community/flash-attn2` | Ampere, Ada, Hopper and Blackwell builds (the Blackwell build ships an `sm_100` cubin). |
+| `flash_attention_3` | `kernels-community/flash-attn3` | Hopper only. |
+| `flash_attention_4` | `kernels-community/flash-attn4` | Hopper and Blackwell; `transformers` pins an older hub revision that can fail against a newer `nvidia-cutlass-dsl` with `cutlass.cute.core has no attribute ThrMma`. Pin the revision yourself (below) or install the PyPI pre-release. |
+
+To pin a hub revision, pass the kernel path with an `@` suffix; it is forwarded to
+`transformers` unchanged:
+
+```yaml
+attn_implementation: kernels-community/flash-attn4@main
+```
+
+The hub kernels are cached under `HF_HUB_CACHE` on first use, so an offline or
+air-gapped job needs them downloaded ahead of time (or the package installed).
+
+#### Installing the packages instead
+
+The Dao-AILab packages still work and take precedence when importable. FA2:
+
+```bash
+pip install flash-attn --no-build-isolation
+```
+
+::: {.callout-tip}
+
+If you get `undefined symbol` while training, ensure you installed PyTorch prior to Axolotl.
+Alternatively, try reinstall or downgrade a version.
+
+:::
+
+FA3 (Hopper only, CUDA 12.8 recommended):
+
+```bash
+git clone https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention/hopper
+python setup.py install
+```
+
+#### Flash Attention 4
+
+Requirements: Hopper or Blackwell GPUs, and `quack-kernels>=0.6.0`. When FA4 is importable
+and compatible with the model, Axolotl upgrades `flash_attention_2`/`flash_attention_3` to
+native `flash_attention_4`. You can also request it explicitly:
+
+```yaml
+attn_implementation: flash_attention_4
+```
+
+Measured on one B200 for an 8,192-token packed row with 48 query / 8 KV heads of dim 128
+(forward and backward): FA4 0.93 ms with a 512-token sliding window and 1.12 ms for full
+attention, against 1.79 ms and 2.81 ms for the FA2 hub kernel.
+
+FA4 is still a pre-release on PyPI, so `--pre` is required:
+
+```bash
+pip install --pre flash-attn-4
+```
+
+On CUDA 13, the `blackwell` extra installs the flash-attn-4 and quack-kernels versions Axolotl's
+B200 CI tests against:
+
+```bash
+pip install "axolotl[blackwell]"
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention/flash_attn/cute
+pip install -e .
+
+# FA2's flash_attn package includes a cute/ stub that shadows FA4.
+# Remove it so Python can find the real FA4 module:
+rm -r $(python -c "import flash_attn; print(flash_attn.__path__[0])")/cute
+```
+
+::: {.callout-important}
+
+FA4 training requires `quack-kernels>=0.6.0` on an `nvidia-cutlass-dsl` within that quack
+release's declared range (0.6.5 needs `>=4.7`). With an older
+quack (0.5.x targets the `4.6.0.dev0` prerelease) the FA4 backward raises
+`cudaErrorIllegalInstruction`. Upgrade with `pip install 'quack-kernels>=0.6.0'`; Axolotl
+warns and keeps your requested backend when the installed quack is too old.
+
+:::
+
+::: {.callout-important}
+
+## Blackwell (B200, GB200): avoid `nvidia-cutlass-dsl` 4.6.0 and 4.6.1
+
+On those two releases `cute.copy` elects internally for bulk copies, so the FA4 backward nests
+elections and hangs. `nvidia-cutlass-dsl` 4.6.2 reverted the change, so stock FA4 works on
+4.6.2 and later. Do not install the
+[Dao-AILab/flash-attention#2689](https://github.com/Dao-AILab/flash-attention/pull/2689) patch
+there: it removes elections that are needed again. Hopper (H100, H200) is unaffected.
+
+On Blackwell with `nvidia-cutlass-dsl` 4.6.0 or 4.6.1, Axolotl warns about this hang and skips
+the automatic upgrade to FA4. When FA4 serves attention, the training log shows
+`Flash Attention 4 in use: first flash_attn_varlen_func call` with the installed versions.
+
+:::
+
+::: {.callout-warning}
+
+FA4 only supports head dimensions up to 128 (`d ≤ 128`). The DeepSeek shape `(192, 128)` is
+also supported but only on Blackwell. Axolotl automatically detects incompatible head dimensions
+and falls back to FA2/3.
+
+:::
+
+### AMD
+
+Requirements: ROCm 6.0 and above. See
+[Flash Attention AMD docs](https://github.com/Dao-AILab/flash-attention/tree/main?tab=readme-ov-file#amd-rocm-support).
+
+### Flex Attention
+
+```yaml
+attn_implementation: flex_attention
+torch_compile: true  # recommended
+```
+
+Requires torch ≥ 2.6. See [PyTorch docs](https://pytorch.org/blog/flexattention/).
+
+### SageAttention
+
+Requirements: Ampere, Ada, or Hopper GPUs.
+
+```yaml
+attn_implementation: sage
+```
+
+```bash
+pip install sageattention==2.2.0 --no-build-isolation
+```
+
+::: {.callout-warning}
+
+Only LoRA/QLoRA recommended. Full finetuning has been observed to drop loss to 0. See
+[GitHub Issue](https://github.com/thu-ml/SageAttention/issues/198).
+
+:::
+
+For more details: [Sage Attention](https://github.com/thu-ml/SageAttention).
+
+### xFormers
+
+```yaml
+attn_implementation: xformers
+```
+
+::: {.callout-tip}
+
+Recommended for Turing GPUs or below (e.g. Colab T4).
+
+:::
+
+### FP8
+
+torchao low-precision attention. Loaded as SDPA and patched post-load.
+
+Requirements: SM90+ (Hopper/Blackwell), PyTorch ≥ 2.11, torchao ≥ 0.17,
+flash-attn with FA3. KV caching must be disabled.
+
+```yaml
+attn_implementation: fp8
+```
+
+### Hub kernels
+
+```yaml
+attn_implementation: kernels-community/flash-attn3
+```
+
+Passed through to `transformers`; axolotl does not install the kernel itself.
+For recognized hub paths the capability flags are set automatically; for
+arbitrary paths axolotl uses conservative defaults (`attn_supports_packing=False`,
+`attn_uses_flash_lib=False`).
+
+## Migrating from legacy boolean flags
+
+The following legacy config fields are **deprecated** and will be removed in a
+future release. Each emits a `DeprecationWarning` when set and is stripped from
+the validated config.
+
+| Legacy | Canonical |
+|---|---|
+| `flash_attention: true` | `attn_implementation: flash_attention_2` |
+| `sdp_attention: true` | `attn_implementation: sdpa` |
+| `xformers_attention: true` | `attn_implementation: xformers` |
+| `flex_attention: true` | `attn_implementation: flex_attention` |
+| `sage_attention: true` | `attn_implementation: sage` |
+| `eager_attention: true` | `attn_implementation: eager` |
+
+Combining `attn_implementation` with a legacy flag (e.g. `attn_implementation:
+flash_attention_2` **and** `flash_attention: true`) raises — pick one.
+
+::: {.callout-note}
+
+Existing example configs under `examples/` still use the legacy flags. They
+continue to work with a deprecation warning; they will be migrated in a
+follow-up pass.
+
+:::

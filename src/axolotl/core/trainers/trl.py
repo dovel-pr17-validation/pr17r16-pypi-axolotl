@@ -1,0 +1,94 @@
+"""Module for TRL RL trainers"""
+
+from trl import KTOTrainer, RewardTrainer
+from trl.experimental.cpo import CPOTrainer
+from trl.experimental.orpo import ORPOTrainer
+
+from axolotl.core.trainers.mixins import (
+    CheckpointWriteRetryMixin,
+    DistributedParallelMixin,
+    RngLoaderMixin,
+)
+from axolotl.core.trainers.mixins.optimizer import OptimizerInitMixin, OptimizerMixin
+from axolotl.core.trainers.mixins.scheduler import SchedulerMixin
+from axolotl.core.trainers.prm.prm_trainer import PRMTrainer
+
+
+class AxolotlORPOTrainer(
+    CheckpointWriteRetryMixin,
+    RngLoaderMixin,
+    SchedulerMixin,
+    OptimizerMixin,
+    OptimizerInitMixin,
+    DistributedParallelMixin,
+    ORPOTrainer,
+):
+    """
+    Extend the base ORPOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "orpo"]
+
+
+class AxolotlKTOTrainer(
+    CheckpointWriteRetryMixin,
+    RngLoaderMixin,
+    SchedulerMixin,
+    OptimizerMixin,
+    OptimizerInitMixin,
+    DistributedParallelMixin,
+    KTOTrainer,
+):
+    """
+    Extend the base KTOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "kto"]
+
+
+class AxolotlCPOTrainer(
+    CheckpointWriteRetryMixin,
+    RngLoaderMixin,
+    SchedulerMixin,
+    OptimizerMixin,
+    OptimizerInitMixin,
+    DistributedParallelMixin,
+    CPOTrainer,
+):
+    """
+    Extend the base CPOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "cpo"]
+
+
+class AxolotlRewardTrainer(
+    CheckpointWriteRetryMixin,
+    RngLoaderMixin,
+    SchedulerMixin,
+    OptimizerMixin,
+    OptimizerInitMixin,
+    DistributedParallelMixin,
+    RewardTrainer,
+):
+    """
+    Extend the base RewardTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "reward"]
+
+
+class AxolotlPRMTrainer(
+    CheckpointWriteRetryMixin,
+    RngLoaderMixin,
+    SchedulerMixin,
+    OptimizerMixin,
+    OptimizerInitMixin,
+    DistributedParallelMixin,
+    PRMTrainer,
+):
+    """
+    Extend the vendored PRMTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "prm"]

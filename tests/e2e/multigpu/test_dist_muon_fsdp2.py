@@ -1,0 +1,170 @@
+"""Test module for DistMuon optimizer with FSDP2 multi-GPU functionality."""
+
+from pathlib import Path
+
+import pytest
+import yaml
+from accelerate.test_utils import execute_subprocess_async
+from transformers.testing_utils import get_torch_dist_unique_port
+
+from tests.e2e.multigpu.utils import fsdp2_training_config
+from tests.e2e.utils import (
+    check_tensorboard_loss_decreased,
+    requires_flash_attn,
+)
+
+pytestmark = [pytest.mark.gpu, requires_flash_attn]
+
+AXOLOTL_ROOT = Path(__file__).parent.parent.parent.parent
+
+
+def verify_training_success(temp_dir, window=3):
+    """Verify that training completed successfully — artifacts, no-NaN, loss
+    stayed in qwen2-pretraining scale (tiny-qwen2-129m final pretrain CE ~3.92).
+    """
+    output_path = Path(temp_dir)
+
+    model_files = list(output_path.glob("*.bin")) + list(
+        output_path.glob("*.safetensors")
+    )
+    assert len(model_files) > 0, "No model files found - training may have failed"
+
+    checkpoint_files = list(output_path.glob("checkpoint-*"))
+    assert len(checkpoint_files) > 0, (
+        "No checkpoint files found - training may have failed"
+    )
+
+    check_tensorboard_loss_decreased(
+        temp_dir + "/runs",
+        initial_window=window,
+        final_window=window,
+        max_initial=5.0,
+        max_final=4.7,
+    )
+
+
+class TestDistMuon:
+    """Test class for DistMuon optimizer with FSDP2 functionality."""
+
+    def test_fft_sft(self, temp_dir):
+        cfg = fsdp2_training_config(
+            {
+                "base_model": "axolotl-ai-co/tiny-qwen2-129m",
+                "sequence_len": 2048,
+                "val_set_size": 0.01,
+                "datasets": [
+                    {
+                        "path": "tatsu-lab/alpaca",
+                        "type": "alpaca",
+                        "split": "train[:10%]",
+                    },
+                ],
+                "num_epochs": 1,
+                # Muon full fine-tuning at this lr shows no loss drop within the first 30 steps
+                "max_steps": 80,
+                "warmup_steps": 5,
+                "micro_batch_size": 2,
+                "gradient_accumulation_steps": 1,
+                "output_dir": temp_dir,
+                "learning_rate": 2e-3,
+                "optimizer": "muon",
+                "weight_decay": 0.01,
+                "lr_scheduler": "cosine",
+                "flash_attention": True,
+                "fsdp_version": 2,
+                "fsdp_config": {
+                    "offload_params": False,
+                    "cpu_ram_efficient_loading": False,
+                    "transformer_layer_cls_to_wrap": "Qwen2DecoderLayer",
+                    "state_dict_type": "FULL_STATE_DICT",
+                    "auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+                    "reshard_after_forward": True,
+                },
+                "use_tensorboard": True,
+                "sample_packing": True,
+                "pad_to_sequence_len": True,
+                "bf16": True,
+            }
+        )
+
+        # write cfg to yaml file
+        Path(temp_dir).mkdir(parents=True, exist_ok=True)
+        with open(Path(temp_dir) / "config.yaml", "w", encoding="utf-8") as fout:
+            fout.write(yaml.dump(cfg.to_dict(), Dumper=yaml.Dumper))
+
+        execute_subprocess_async(
+            [
+                "axolotl",
+                "train",
+                str(Path(temp_dir) / "config.yaml"),
+                "--num-processes",
+                "2",
+                "--main-process-port",
+                f"{get_torch_dist_unique_port()}",
+            ]
+        )
+
+        verify_training_success(temp_dir, window=10)
+
+    def test_lora_sft(self, temp_dir):
+        cfg = fsdp2_training_config(
+            {
+                "base_model": "axolotl-ai-co/tiny-qwen2-129m",
+                "sequence_len": 2048,
+                "val_set_size": 0.01,
+                "datasets": [
+                    {
+                        "path": "tatsu-lab/alpaca",
+                        "type": "alpaca",
+                        "split": "train[:10%]",
+                    },
+                ],
+                "adapter": "lora",
+                "lora_r": 8,
+                "lora_alpha": 16,
+                "lora_dropout": 0.0,
+                "lora_target_linear": True,
+                "num_epochs": 1,
+                "max_steps": 20,
+                "micro_batch_size": 2,
+                "gradient_accumulation_steps": 1,
+                "output_dir": temp_dir,
+                "learning_rate": 2e-3,
+                "optimizer": "muon",
+                "weight_decay": 0.01,
+                "lr_scheduler": "cosine",
+                "flash_attention": True,
+                "fsdp_version": 2,
+                "fsdp_config": {
+                    "offload_params": False,
+                    "cpu_ram_efficient_loading": False,
+                    "transformer_layer_cls_to_wrap": "Qwen2DecoderLayer",
+                    "state_dict_type": "FULL_STATE_DICT",
+                    "auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+                    "reshard_after_forward": True,
+                },
+                "use_tensorboard": True,
+                "sample_packing": True,
+                "pad_to_sequence_len": True,
+                "bf16": True,
+            }
+        )
+
+        # write cfg to yaml file
+        Path(temp_dir).mkdir(parents=True, exist_ok=True)
+        with open(Path(temp_dir) / "config.yaml", "w", encoding="utf-8") as fout:
+            fout.write(yaml.dump(cfg.to_dict(), Dumper=yaml.Dumper))
+
+        execute_subprocess_async(
+            [
+                "axolotl",
+                "train",
+                str(Path(temp_dir) / "config.yaml"),
+                "--num-processes",
+                "2",
+                "--main-process-port",
+                f"{get_torch_dist_unique_port()}",
+            ]
+        )
+
+        verify_training_success(temp_dir)
